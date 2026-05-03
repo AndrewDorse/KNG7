@@ -5,6 +5,10 @@ same side rule as sims (``_cheap_side_at``), **one** $1 USDC FAK buy per window.
 
 Stdout: **only** ``INIT`` line at start and ``WIN`` lines when a placed trade resolves winning.
 Everything else is silent (set library loggers to CRITICAL before trader init).
+
+Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), and immediately after a fill,
+places GTC limit sells at **99¢** for whole-share inventory on **each** of UP and DOWN tokens
+that have a position (so two legs get two sells).
 """
 
 from __future__ import annotations
@@ -100,6 +104,8 @@ class Cheap03FirstEngine:
         self._last_slug: str | None = None
         self._fired_this_slug = False
         self._pending: _OpenTrade | None = None
+        self._last_tp_sync_monotonic: float = 0.0
+        self._tp_poll_seconds: float = float(os.getenv("BOT_TP_POLL_SECONDS", "15"))
 
     def _emit_init(self, contract: ActiveContract | None) -> None:
         slug = contract.slug if contract else "(no contract yet)"
@@ -130,6 +136,13 @@ class Cheap03FirstEngine:
         if w == want:
             self._emit_win(slug, want)
         self._pending = None
+
+    def _maybe_sync_tp_limits(self, contract: ActiveContract, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_tp_sync_monotonic) < self._tp_poll_seconds:
+            return
+        self.trader.sync_tp_limit_sells_99c(contract, dry_run=self.config.dry_run)
+        self._last_tp_sync_monotonic = now
 
     def run(self) -> None:
         contract0 = self.locator.get_active_contract()
@@ -188,6 +201,7 @@ class Cheap03FirstEngine:
                     token_id=token.token_id,
                     notional_usdc=float(self.notional),
                 )
+                self._maybe_sync_tp_limits(contract, force=True)
                 _ = entry
             except KeyboardInterrupt:
                 raise

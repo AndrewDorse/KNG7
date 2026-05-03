@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from decimal import ROUND_DOWN, Decimal
@@ -45,7 +46,10 @@ except Exception:
 
 from config import (
     HOST, CHAIN_ID, BUY, SELL, LOGGER,
-    BotConfig, TokenMarket, parse_balance_response,
+    ActiveContract,
+    BotConfig,
+    TokenMarket,
+    parse_balance_response,
 )
 
 _ORDER_VERSION_MISMATCH_SNIPPET = "order_version_mismatch"
@@ -70,6 +74,58 @@ def _clob_taker_size_shares(size: float) -> float:
         return 0.0
     q = Decimal(str(float(size))).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
     return float(f"{float(q):.4f}")
+
+
+def _float_field(x: Any) -> float:
+    try:
+        if x is None or x == "":
+            return 0.0
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _open_order_token_id(o: dict[str, Any]) -> str:
+    return str(
+        o.get("asset_id")
+        or o.get("assetId")
+        or o.get("token_id")
+        or o.get("tokenId")
+        or ""
+    )
+
+
+def _open_order_remaining_shares(o: dict[str, Any]) -> float:
+    """Resting size on an open order (handles micro-unit fixed-point from the CLOB)."""
+    from clob_fak import _decode_fixed_size
+
+    raw_size = o.get("size")
+    if raw_size is not None and raw_size != "":
+        v = _float_field(raw_size)
+        if v > 1_000_000:
+            return max(0.0, _decode_fixed_size(raw_size))
+        return max(0.0, v)
+    orig = o.get("original_size") or o.get("originalSize")
+    matched = o.get("size_matched") or o.get("sizeMatched") or 0
+    if orig is not None and orig != "":
+        o_raw = _float_field(orig)
+        o_sz = _decode_fixed_size(orig) if o_raw > 1_000_000 else o_raw
+        m_raw = _float_field(matched)
+        m_sz = (
+            _decode_fixed_size(matched)
+            if matched not in (None, "") and m_raw > 1_000_000
+            else m_raw
+        )
+        return max(0.0, o_sz - m_sz)
+    return 0.0
+
+
+def _open_order_side_upper(o: dict[str, Any]) -> str:
+    return str(o.get("side") or "").upper()
+
+
+def _open_order_price(o: dict[str, Any]) -> float:
+    return _float_field(o.get("price"))
 
 
 def _retry(max_attempts=2, backoff_base=0.5, retryable=(requests.RequestException,)):
@@ -734,6 +790,110 @@ class PolymarketTrader:
         if cancelled:
             LOGGER.info("Cancelled %d/%d open orders", cancelled, len(open_orders))
         return cancelled
+
+    def sync_tp_limit_sells_99c(self, contract: ActiveContract, *, dry_run: bool) -> None:
+        """Resting take-profit: one GTC limit sell at $0.99 per outcome token for whole-share inventory.
+
+        Poll from the engine (~15s). If both UP and DOWN have inventory, places (or refreshes) two sells.
+        Open sell size plus free conditional balance is used so shares escrowed in an existing TP still count.
+        """
+        try:
+            open_orders = self.get_open_orders()
+        except Exception as exc:
+            LOGGER.warning("[TP99] %s | get_open_orders failed: %s", contract.slug, exc)
+            open_orders = []
+        for token in (contract.up, contract.down):
+            self._sync_tp99_for_token(contract.slug, token, open_orders, dry_run=dry_run)
+
+    def _sync_tp99_for_token(
+        self,
+        slug: str,
+        token: TokenMarket,
+        open_orders: list[dict[str, Any]],
+        *,
+        dry_run: bool,
+    ) -> None:
+        tid = token.token_id
+        tp = 0.99
+        match_tol = 0.005
+        size_tol = 0.05
+
+        tp_orders = [
+            o
+            for o in open_orders
+            if _open_order_token_id(o) == tid
+            and _open_order_side_upper(o) == SELL
+            and abs(_open_order_price(o) - tp) <= match_tol
+        ]
+        reserved = sum(_open_order_remaining_shares(o) for o in tp_orders)
+        try:
+            free = self.token_balance_allowance_refreshed(tid)
+        except Exception as exc:
+            LOGGER.warning("[TP99] %s | %s balance read failed: %s", slug, token.outcome, exc)
+            return
+
+        total = free + reserved
+        want = int(math.floor(total + 1e-9))
+
+        if want < 1:
+            if not tp_orders:
+                return
+            if dry_run:
+                LOGGER.debug("[TP99 dry_run] %s | %s | would cancel stale TP (no inventory)", slug, token.outcome)
+                return
+            for o in tp_orders:
+                oid = str(o.get("id") or o.get("orderID") or "")
+                if oid:
+                    self.cancel_order(oid)
+            return
+
+        if reserved > 0 and abs(reserved - float(want)) <= size_tol:
+            return
+
+        if dry_run:
+            LOGGER.debug(
+                "[TP99 dry_run] %s | %s | would refresh $%.2f sell x %d (free=%.4f reserved=%.4f)",
+                slug,
+                token.outcome,
+                tp,
+                want,
+                free,
+                reserved,
+            )
+            return
+
+        for o in tp_orders:
+            oid = str(o.get("id") or o.get("orderID") or "")
+            if oid:
+                self.cancel_order(oid)
+
+        try:
+            free2 = self.token_balance_allowance_refreshed(tid)
+        except Exception:
+            free2 = free
+        want2 = int(math.floor(free2 + 1e-9))
+        if want2 < 1:
+            return
+        try:
+            resp = self.place_limit_sell(token, tp, want2)
+            oid = str(resp.get("orderID") or resp.get("id") or "")
+            LOGGER.info(
+                "[TP99] %s | %s | placed $%.2f GTC sell x %d order=%s",
+                slug,
+                token.outcome,
+                tp,
+                want2,
+                oid[:16] if oid else "n/a",
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "[TP99] %s | %s | place $%.2f x %d failed: %s",
+                slug,
+                token.outcome,
+                tp,
+                want2,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Market data — live market price

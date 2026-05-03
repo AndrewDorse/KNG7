@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Live / dry-run: **first midpoint** on BTC 15m UP/DOWN where a leg is at or under **3c** (0.03),
-same side rule as sims (``_cheap_side_at``), **one** $1 USDC FAK buy per window.
+Live / dry-run: BTC 15m UP/DOWN **cheap03** entry.
 
-Stdout: **only** ``INIT`` line at start and ``WIN`` lines when a placed trade resolves winning.
-Everything else is silent (set library loggers to CRITICAL before trader init).
+**Entry** (``BOT_CHEAP03_ENTRY``, default ``dual_limits``):
+  ``dual_limits`` — on each new window, place **GTC limit buys** at ``BOT_CHEAP03_LIMIT_PX``
+  (default 0.03) for ``BOT_CHEAP03_LIMIT_SHARES`` (default 34) on **both** UP and DOWN (resting bids).
+  ``market`` — legacy: no entry limits; **one** $1 USDC FAK when midpoint first touches ≤3¢
+  (``_cheap_side_at``), same as early KNG7.
 
-Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), and immediately after a fill,
-places GTC limit sells at **99¢** for whole-share inventory on **each** of UP and DOWN tokens
-that have a position (so two legs get two sells).
+Stdout: **only** ``INIT`` line at start and ``WIN`` lines when a placed trade resolves winning
+(market mode only today). Other activity uses the library logger.
+
+Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), and immediately after a fill
+(market path), GTC limit sells at **99¢** for whole-share inventory per side.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import Literal
 
 import requests
 
-from config import GAMMA_URL, ActiveContract, BotConfig, TokenMarket
+from config import GAMMA_URL, LOGGER, ActiveContract, BotConfig, TokenMarket
 from http_session import create_polymarket_session
 from market_locator import GammaMarketLocator
 from trader import PolymarketTrader
@@ -106,13 +110,26 @@ class Cheap03FirstEngine:
         self._pending: _OpenTrade | None = None
         self._last_tp_sync_monotonic: float = 0.0
         self._tp_poll_seconds: float = float(os.getenv("BOT_TP_POLL_SECONDS", "15"))
+        entry_raw = (os.getenv("BOT_CHEAP03_ENTRY") or "dual_limits").strip().lower()
+        self._entry_dual_limits: bool = entry_raw not in (
+            "market",
+            "fak",
+            "first_touch",
+            "first_cheap",
+        )
+        self._limit_buy_px: float = float(os.getenv("BOT_CHEAP03_LIMIT_PX", "0.03"))
+        self._limit_buy_shares: int = int(os.getenv("BOT_CHEAP03_LIMIT_SHARES", "34"))
+        self._seed_up_done: bool = False
+        self._seed_down_done: bool = False
 
     def _emit_init(self, contract: ActiveContract | None) -> None:
         slug = contract.slug if contract else "(no contract yet)"
+        mode = "dual_limits" if self._entry_dual_limits else "market_fak"
         _out(
             "INIT "
             f"strategy=first_cheap_03 slug={slug} "
-            f"thr={self.thr:g} notional_usdc={self.notional:g} "
+            f"entry={mode} thr={self.thr:g} notional_usdc={self.notional:g} "
+            f"limit_px={self._limit_buy_px:g} limit_shares={self._limit_buy_shares} "
             f"dry_run={self.config.dry_run} funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
         )
 
@@ -144,6 +161,60 @@ class Cheap03FirstEngine:
         self.trader.sync_tp_limit_sells_99c(contract, dry_run=self.config.dry_run)
         self._last_tp_sync_monotonic = now
 
+    def _try_seed_dual_buy_limits(self, contract: ActiveContract) -> None:
+        """Resting GTC bids at ``_limit_buy_px`` on UP and DOWN (``cheap03_dual``-style)."""
+        lim = round(float(self._limit_buy_px), 2)
+        sh = int(self._limit_buy_shares)
+        if sh < 1:
+            return
+        for outcome, token, flag in (
+            ("UP", contract.up, "up"),
+            ("DOWN", contract.down, "down"),
+        ):
+            done = self._seed_up_done if flag == "up" else self._seed_down_done
+            if done:
+                continue
+            if self.config.dry_run:
+                if flag == "up":
+                    self._seed_up_done = True
+                else:
+                    self._seed_down_done = True
+                continue
+            if self.trader.has_open_limit_buy_near(token.token_id, lim):
+                if flag == "up":
+                    self._seed_up_done = True
+                else:
+                    self._seed_down_done = True
+                LOGGER.info(
+                    "[CHEAP03_ENTRY] %s | %s | existing BUY ~$%.2f on book",
+                    contract.slug,
+                    outcome,
+                    lim,
+                )
+                continue
+            try:
+                self.trader.place_limit_buy(token, lim, sh)
+                if flag == "up":
+                    self._seed_up_done = True
+                else:
+                    self._seed_down_done = True
+                LOGGER.info(
+                    "[CHEAP03_ENTRY] %s | placed BUY limit %s $%.2f x %d",
+                    contract.slug,
+                    outcome,
+                    lim,
+                    sh,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "[CHEAP03_ENTRY] %s | %s BUY $%.2f x %d failed: %s",
+                    contract.slug,
+                    outcome,
+                    lim,
+                    sh,
+                    exc,
+                )
+
     def run(self) -> None:
         contract0 = self.locator.get_active_contract()
         self._emit_init(contract0)
@@ -160,6 +231,22 @@ class Cheap03FirstEngine:
                     self._try_resolve_pending(cur_slug)
                     self._last_slug = cur_slug
                     self._fired_this_slug = False
+                    # New window: do not inherit the 15s TP gate from the previous market's tokens.
+                    self._last_tp_sync_monotonic = 0.0
+                    self._seed_up_done = False
+                    self._seed_down_done = False
+
+                # Must run *before* ``_fired_this_slug`` continue — otherwise after a fill we never
+                # poll TP again (balance lag / transient place failure would leave no 99c sells).
+                self._maybe_sync_tp_limits(contract)
+
+                if self._entry_dual_limits:
+                    self._try_seed_dual_buy_limits(contract)
+                    if not (self._seed_up_done and self._seed_down_done):
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
 
                 if self._fired_this_slug:
                     time.sleep(self.config.poll_interval_seconds)

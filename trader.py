@@ -760,6 +760,25 @@ class PolymarketTrader:
         except Exception:
             return []
 
+    def has_open_limit_buy_near(
+        self, token_id: str, price: float, *, tol: float = 0.01
+    ) -> bool:
+        """True if a resting BUY exists on ``token_id`` with limit price within ``tol`` of ``price``."""
+        try:
+            raw = self.get_open_orders()
+        except Exception:
+            return False
+        for o in raw:
+            if _open_order_token_id(o) != token_id:
+                continue
+            if _open_order_side_upper(o) != BUY:
+                continue
+            if abs(_open_order_price(o) - float(price)) > tol:
+                continue
+            if _open_order_remaining_shares(o) > 1e-6:
+                return True
+        return False
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order by ID. Returns True on success."""
         try:

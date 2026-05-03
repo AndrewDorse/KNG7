@@ -1,0 +1,10 @@
+# KNG7: first_cheap_03 (first 3c midpoint, $1 FAK / window). Copy .env.example -> .env
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./exports:/app/exports

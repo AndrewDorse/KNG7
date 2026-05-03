@@ -11,8 +11,9 @@ Live / dry-run: BTC 15m UP/DOWN **cheap03** entry.
 Stdout: **only** ``INIT`` line at start and ``WIN`` lines when a placed trade resolves winning
 (market mode only today). Other activity uses the library logger.
 
-Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), and immediately after a fill
-(market path), GTC limit sells at **99¢** for whole-share inventory per side.
+Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), GTC limit sells at **99¢**
+for each side with whole-share inventory (free balance + shares already listed at 99¢).
+Market-entry mode also forces one TP sync right after a FAK fill.
 """
 
 from __future__ import annotations
@@ -245,6 +246,8 @@ class Cheap03FirstEngine:
                     if not (self._seed_up_done and self._seed_down_done):
                         time.sleep(self.config.poll_interval_seconds)
                         continue
+                    # After both bids rest, re-check TP every poll (fills can land anytime).
+                    self._maybe_sync_tp_limits(contract, force=True)
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 

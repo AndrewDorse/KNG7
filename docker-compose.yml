@@ -1,4 +1,4 @@
-# KNG7: first_cheap_03 (first 3c midpoint, $1 FAK / window). Copy .env.example -> .env
+# KNG7: first_cheap_03 — dual 3c GTC bids (default) + 99c TP when sized. Copy .env.example -> .env
 services:
   bot:
     build: .

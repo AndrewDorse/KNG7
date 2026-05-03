@@ -1,27 +1,39 @@
 #!/usr/bin/env python3
-"""KNG7 Docker: **first_cheap_03** — first 3c midpoint touch, $1 USDC FAK per 15m window."""
+"""KNG7 Docker: **first_cheap_03** — dual GTC bids at 3¢ (default) + TP sync at 99¢ when sized."""
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 
-def _silence_third_party_loggers() -> None:
-    logging.getLogger().setLevel(logging.CRITICAL)
+def _configure_logging() -> None:
+    """Keep noisy HTTP/SDK loggers quiet; surface our bot logger for live ops (entry + TP lines)."""
     for name in (
-        "polymarket_btc_ladder",
         "urllib3",
         "requests",
         "websocket",
         "websockets",
         "py_clob_client",
+        "py_clob_client_v2",
     ):
-        logging.getLogger(name).setLevel(logging.CRITICAL)
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    app = logging.getLogger("polymarket_btc_ladder")
+    level_name = (os.getenv("BOT_LOG_LEVEL") or "INFO").strip().upper()
+    app.setLevel(getattr(logging, level_name, logging.INFO))
+    if not app.handlers:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        app.addHandler(h)
+    app.propagate = False
+
+    logging.getLogger().setLevel(logging.WARNING)
 
 
 def main() -> int:
-    _silence_third_party_loggers()
+    _configure_logging()
 
     from config import BotConfig, BotConfigError  # noqa: PLC0415
     from market_locator import GammaMarketLocator  # noqa: PLC0415

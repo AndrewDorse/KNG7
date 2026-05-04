@@ -2,6 +2,8 @@
 
 One **BTC 5m or 15m UP/DOWN** market at a time (Gamma slug `btc-updown-5m-<epoch>` or `btc-updown-15m-<epoch>`). Set **`BOT_WINDOW_MINUTES=5`** or **`15`** (other values are rejected for this strategy). Same **`btc50_1c`** rules: 1¢ first touch, Binance BTC move vs anchor **\< \$50**, **\$1** FAK, TP **70¢** (defaults below).
 
+**Not simultaneous in one process:** a single container follows **one** `BOT_WINDOW_MINUTES`. If logs only show `btc-updown-15m-…`, your `.env` still has **`BOT_WINDOW_MINUTES=15`** (the default). To trade **5m only**, set **`BOT_WINDOW_MINUTES=5`** and redeploy. To run **both 5m and 15m at once**, use two containers — e.g. **`docker compose --profile five_m up -d`**, which starts the default **`bot`** (uses `.env`) plus **`bot_5m`** (Compose overrides window minutes to **5**). Both share the same **`.env` keys**; treat that as **double live risk** unless you split wallets/projects.
+
 ## Default behavior (`BOT_CHEAP03_ENTRY=btc50_1c`)
 
 Pool-tuned preset: **1¢** first-touch, **Binance** spot move from window anchor **\< \$50**, **\$1** FAK buy, resting TP at **`BOT_TP_LIMIT_PX`** (default **70¢**).

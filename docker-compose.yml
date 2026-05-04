@@ -1,10 +1,28 @@
 # KNG7: first_cheap_03 — BTC 5m or 15m (BOT_WINDOW_MINUTES); default btc50_1c (1c + BTC<$50 + 70c TP). Copy .env.example -> .env
+#
+# One process = one window length. Default service `bot` uses BOT_WINDOW_MINUTES from .env (15 in .env.example).
+# For 5m AND 15m at the same time, start the optional 5m service (same keys/budget — review risk):
+#   docker compose --profile five_m up -d
+# That runs `bot` (15m) + `bot_5m` (BOT_WINDOW_MINUTES forced to 5). Logs: filter by container name.
 services:
   bot:
     build: .
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+
+  bot_5m:
+    profiles:
+      - five_m
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BOT_WINDOW_MINUTES: "5"
     volumes:
       - ./logs:/app/logs
       - ./exports:/app/exports

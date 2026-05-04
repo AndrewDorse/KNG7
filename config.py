@@ -626,6 +626,11 @@ class BotConfig:
                 f"BOT_STRATEGY_MIN_BUDGET_USDC ({cfg.strategy_min_budget_usdc}) for strategy_mode="
                 f"{cfg.strategy_mode!r}"
             )
+        if cfg.strategy_mode == "first_cheap_03" and cfg.window_minutes not in (5, 15):
+            raise BotConfigError(
+                "BOT_WINDOW_MINUTES for first_cheap_03 must be 5 or 15 "
+                f"(Gamma slug btc-updown-{{5|15}}m-<epoch>; got {cfg.window_minutes})."
+            )
         return cfg
 
 

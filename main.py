@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KNG7 Docker: **first_cheap_03** — default btc50_1c (1¢ + BTC move gate + 70¢ TP) or dual/market."""
+"""KNG7 Docker: **first_cheap_03** — BTC 5m/15m; default btc50_1c (1¢ + BTC move gate + 70¢ TP) or dual/market."""
 
 from __future__ import annotations
 

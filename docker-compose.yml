@@ -1,4 +1,4 @@
-# KNG7: first_cheap_03 — default btc50_1c (1c + BTC<$50 move + 70c TP). Copy .env.example -> .env
+# KNG7: first_cheap_03 — BTC 5m or 15m (BOT_WINDOW_MINUTES); default btc50_1c (1c + BTC<$50 + 70c TP). Copy .env.example -> .env
 services:
   bot:
     build: .

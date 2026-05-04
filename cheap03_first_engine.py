@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Live / dry-run: BTC 15m UP/DOWN **cheap03** entry.
+Live / dry-run: BTC **5m or 15m** UP/DOWN **cheap03** entry (``BOT_WINDOW_MINUTES``).
 
 **Entry** (``BOT_CHEAP03_ENTRY``, default ``btc50_1c`` — pool sweep winner):
 
@@ -145,7 +145,7 @@ class Cheap03FirstEngine:
             mode = "market_fak"
         _out(
             "INIT "
-            f"strategy=first_cheap_03 slug={slug} "
+            f"strategy=first_cheap_03 window={self.config.window_minutes}m slug={slug} "
             f"entry={mode} thr={self.thr:g} notional_usdc={self.notional:g} "
             f"limit_px={self._limit_buy_px:g} limit_shares={self._limit_buy_shares} "
             f"dry_run={self.config.dry_run} funder={self.config.funder[:6]}…{self.config.funder[-4:]}"

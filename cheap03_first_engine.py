@@ -15,10 +15,10 @@ state, anchors, and TP polling per lane. Single value (e.g. ``15``) = one lane o
 - ``market`` — legacy FAK when mid touches ≤ ``BOT_CHEAP03_PRICE_MAX`` (default 3¢), no BTC gate.
 
 **Take-profit:** GTC sells at ``BOT_TP_LIMIT_PX`` (default **70¢** for ``btc50_1c``, **99¢** for
-``dual_limits`` / ``market`` unless overridden). Poll ``BOT_TP_POLL_SECONDS``; ``btc50_1c`` forces
-TP sync each poll after entry is armed like dual mode.
+``dual_limits`` / ``market`` unless overridden). Re-sync at ``BOT_TP_POLL_SECONDS``; one immediate
+sync after each entry. No per-second TP hammer.
 
-Stdout: ``INIT`` / ``WIN`` (market). Library logger for entries and TP.
+Stdout: ``INIT`` / ``DEAL_START`` / ``WIN``. Stderr: errors only (``BOT_LOG_LEVEL`` default ERROR).
 """
 
 from __future__ import annotations
@@ -114,6 +114,8 @@ class _LaneState:
     seed_up_done: bool = False
     seed_down_done: bool = False
     btc_anchor_usd: float | None = None
+    # dual_limits: run TP sync once when both resting bids are in place (not every poll).
+    dual_tp_synced_once: bool = False
 
 
 class Cheap03FirstEngine:
@@ -280,16 +282,17 @@ class Cheap03FirstEngine:
             st.seed_up_done = False
             st.seed_down_done = False
             st.btc_anchor_usd = None
+            st.dual_tp_synced_once = False
 
         self._maybe_sync_tp_limits(contract, st)
-        if self._entry_btc50_1c and st.fired_this_slug:
-            self._maybe_sync_tp_limits(contract, st, force=True)
 
         if self._entry_dual_limits:
             self._try_seed_dual_buy_limits(contract, st)
             if not (st.seed_up_done and st.seed_down_done):
                 return
-            self._maybe_sync_tp_limits(contract, st, force=True)
+            if not st.dual_tp_synced_once:
+                self._maybe_sync_tp_limits(contract, st, force=True)
+                st.dual_tp_synced_once = True
             return
 
         if self._entry_btc50_1c:

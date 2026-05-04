@@ -816,7 +816,7 @@ class PolymarketTrader:
         try:
             open_orders = self.get_open_orders()
         except Exception as exc:
-            LOGGER.warning("[TP] %s | get_open_orders failed: %s", contract.slug, exc)
+            LOGGER.debug("[TP] %s | get_open_orders failed: %s", contract.slug, exc)
             open_orders = []
         for token in (contract.up, contract.down):
             self._sync_tp_limit_for_token(contract.slug, token, open_orders, tp=tp, dry_run=dry_run)
@@ -849,7 +849,7 @@ class PolymarketTrader:
         try:
             free = self.token_balance_allowance_refreshed(tid)
         except Exception as exc:
-            LOGGER.warning("[TP] %s | %s balance read failed: %s", slug, token.outcome, exc)
+            LOGGER.debug("[TP] %s | %s balance read failed: %s", slug, token.outcome, exc)
             return
 
         total = free + reserved
@@ -897,7 +897,7 @@ class PolymarketTrader:
         try:
             resp = self.place_limit_sell(token, tp, want2)
             oid = str(resp.get("orderID") or resp.get("id") or "")
-            LOGGER.info(
+            LOGGER.debug(
                 "[TP] %s | %s | placed $%.2f GTC sell x %d order=%s",
                 slug,
                 token.outcome,
@@ -906,7 +906,7 @@ class PolymarketTrader:
                 oid[:16] if oid else "n/a",
             )
         except Exception as exc:
-            LOGGER.warning(
+            LOGGER.error(
                 "[TP] %s | %s | place $%.2f x %d failed: %s",
                 slug,
                 token.outcome,

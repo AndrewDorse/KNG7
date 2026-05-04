@@ -226,7 +226,7 @@ def refine_fak_buy_with_get_order(
             if econ is not None:
                 sh, usdc = econ
                 apx = usdc / sh if sh > 1e-12 else float(limit_price)
-                LOGGER.info(
+                LOGGER.debug(
                     "FAK confirm GET /order: matched=%.4f sh vwap=%.4f (~$%.2f) [taking/making]",
                     sh,
                     apx,
@@ -234,7 +234,7 @@ def refine_fak_buy_with_get_order(
                 )
                 return sh, usdc, apx
             usdc = matched * px_lim
-            LOGGER.warning(
+            LOGGER.debug(
                 "FAK confirm GET /order: OpenOrder has no taking/making; using size_matched * "
                 "OpenOrder.price — **price is LIMIT (FAK cap), not execution VWAP** "
                 "(see Polymarket OpenOrder docs). matched=%.4f limit_px=%.4f (~$%.2f). "

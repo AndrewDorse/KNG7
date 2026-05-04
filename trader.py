@@ -212,7 +212,7 @@ class PolymarketTrader:
                     ids.append(tid)
         if not ids:
             return
-        self._ws_feed.set_assets(ids)
+        self._ws_feed.set_assets(sorted(ids))
 
     def _ws_bid_ask_mid(self, token_id: str) -> tuple[float, float, float] | None:
         if self._ws_feed is None:
@@ -226,6 +226,40 @@ class PolymarketTrader:
         if bid <= 0 or ask <= 0:
             return None
         return bid, ask, (bid + ask) / 2.0
+
+    def _rest_midpoint_clob(self, token_id: str) -> float | None:
+        """CLOB ``/midpoint`` (works when one side of the book is empty)."""
+        try:
+            raw = self.client.get_midpoint(token_id)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            v = raw.get("mid")
+            if v is None:
+                v = raw.get("price") or raw.get("value")
+            if v is None or v == "":
+                return None
+            try:
+                out = float(v)
+            except (TypeError, ValueError):
+                return None
+            return out if out > 0 else None
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return None
+            try:
+                out = float(s)
+            except ValueError:
+                return None
+            return out if out > 0 else None
+        try:
+            out = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return out if out > 0 else None
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -1123,7 +1157,7 @@ class PolymarketTrader:
             bids = book.get("bids") or []
             asks = book.get("asks") or []
             if not bids or not asks:
-                return None
+                return self._rest_midpoint_clob(token_id)
             best_bid: float | None = None
             for b in bids:
                 p = float(b.get("price", 0) or 0)
@@ -1135,10 +1169,10 @@ class PolymarketTrader:
                 if p > 0 and (best_ask is None or p < best_ask):
                     best_ask = p
             if best_bid is None or best_ask is None:
-                return None
+                return self._rest_midpoint_clob(token_id)
             return (best_bid + best_ask) / 2.0
         except Exception:
-            return None
+            return self._rest_midpoint_clob(token_id)
 
     def get_spread(self, token_id: str) -> dict[str, float | None]:
         """Get best bid, best ask, and spread for a token.

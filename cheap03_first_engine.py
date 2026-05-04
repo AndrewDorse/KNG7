@@ -317,7 +317,8 @@ class Cheap03FirstEngine:
                 if st.no_mid_streak >= 30 and not st.mid_error_logged:
                     st.mid_error_logged = True
                     LOGGER.error(
-                        "[DATA] %dm %s no midpoint for 30+ polls (ws=%s). Check CLOB feed/network.",
+                        "[DATA] %dm %s no midpoint for 30+ polls (ws=%s). "
+                        "Check WSS egress, BOT_POLY_WS_MAX_AGE_SEC, and CLOB /midpoint+book for these tokens.",
                         wm,
                         cur_slug,
                         "on" if self.trader.ws_quotes_active else "off",

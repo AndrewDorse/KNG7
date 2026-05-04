@@ -38,6 +38,7 @@ class MarketWsFeed:
         self._lock = threading.Lock()
         self._quotes: dict[str, dict[str, float]] = {}
         self._subscribed: tuple[str, ...] = ()
+        self._subscribed_key: frozenset[str] = frozenset()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._ws_app: Any = None
@@ -60,13 +61,18 @@ class MarketWsFeed:
             self._thread = None
 
     def set_assets(self, asset_ids: list[str]) -> None:
-        """Subscribe to these token IDs; reconnects if the set changed."""
-        t = tuple(asset_ids)
+        """Subscribe to these token IDs; reconnects if the set changed.
+
+        Compares as a set so lane iteration order does not churn reconnects.
+        """
+        uniq = sorted({str(x).strip() for x in asset_ids if str(x).strip()})
+        key = frozenset(uniq)
         with self._lock:
-            if t == self._subscribed:
+            if key == self._subscribed_key:
                 return
-            self._subscribed = t
-        LOGGER.debug("WS market: asset set changed (%d ids); reconnect", len(t))
+            self._subscribed_key = key
+            self._subscribed = tuple(uniq)
+        LOGGER.debug("WS market: asset set changed (%d ids); reconnect", len(uniq))
         self._close_ws()
 
     def mid_for(self, asset_id: str, max_age_sec: float = 4.0) -> float | None:
@@ -142,7 +148,25 @@ class MarketWsFeed:
                 aid = str(ch.get("asset_id") or "")
                 bb = _to_float(ch.get("best_bid"))
                 ba = _to_float(ch.get("best_ask"))
-                if aid and bb > 0 and ba > 0:
+                if aid and (ba > 0 or bb > 0):
+                    if bb > 0 and ba > 0:
+                        self._set_quote(aid, bb, ba)
+                    elif ba > 0 and bb <= 0:
+                        bb2 = max(0.01, min(ba - 1e-6, ba * 0.98))
+                        if ba > bb2:
+                            self._set_quote(aid, bb2, ba)
+                    elif bb > 0 and ba <= 0:
+                        ba2 = min(0.99, max(bb + 1e-6, bb * 1.02))
+                        if ba2 > bb:
+                            self._set_quote(aid, bb, ba2)
+        elif et == "last_trade_price":
+            aid = str(msg.get("asset_id") or "")
+            px = _to_float(msg.get("price"))
+            if aid and px > 0:
+                eps = 0.005
+                bb = max(0.01, px - eps)
+                ba = min(0.99, px + eps)
+                if ba > bb:
                     self._set_quote(aid, bb, ba)
 
     def _run_loop(self) -> None:

@@ -659,12 +659,14 @@ class PolymarketTrader:
             slip = float(slip_raw) if slip_raw not in (None, "") else _DEFAULT_MARKET_BUY_SLIPPAGE_USD
         except (TypeError, ValueError):
             slip = _DEFAULT_MARKET_BUY_SLIPPAGE_USD
-        if slip < 0:
-            slip = 0.0
+        if not math.isfinite(slip) or slip < 0:
+            slip = _DEFAULT_MARKET_BUY_SLIPPAGE_USD
         ask = self.get_best_ask(token.token_id)
         if ask is None or ask <= 0.0:
             raise RuntimeError("market_buy_usdc: no_best_ask_empty_book")
         ask_f = float(ask)
+        if not math.isfinite(ask_f):
+            raise RuntimeError("market_buy_usdc: invalid_ask")
         ask_r = round(ask_f, 2)
         target = round(ask_f + float(slip), 2)
         # At least the visible ask (2dp), plus slippage when room below 0.99.

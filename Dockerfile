@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 ARG KNG7_IMAGE_TAG=2026-05-02-first-cheap-03
 LABEL org.opencontainers.image.title="KNG7 first_cheap_03" \
-      org.opencontainers.image.description="Docker: BTC 5m/15m btc50_1c (1c+BTC gate+70c TP) or dual/market" \
+      org.opencontainers.image.description="Docker: BTC 5m/15m/both (comma BOT_WINDOW_MINUTES) btc50_1c or dual/market" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

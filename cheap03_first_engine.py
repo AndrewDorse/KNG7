@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Live / dry-run: BTC **5m or 15m** UP/DOWN **cheap03** entry (``BOT_WINDOW_MINUTES``).
+Live / dry-run: BTC **5m and/or 15m** UP/DOWN **cheap03** entry (``BOT_WINDOW_MINUTES``).
+
+Use ``BOT_WINDOW_MINUTES=5,15`` (or ``15,5``) to run **both** lengths in **one** process: separate
+state, anchors, and TP polling per lane. Single value (e.g. ``15``) = one lane only.
 
 **Entry** (``BOT_CHEAP03_ENTRY``, default ``btc50_1c`` — pool sweep winner):
 
@@ -100,6 +103,19 @@ class _OpenTrade:
     notional_usdc: float
 
 
+@dataclass(slots=True)
+class _LaneState:
+    """Per-``BOT_WINDOW_MINUTES`` lane (e.g. 5 vs 15) so two markets can trade in parallel."""
+
+    last_slug: str | None = None
+    fired_this_slug: bool = False
+    pending: _OpenTrade | None = None
+    last_tp_sync_monotonic: float = 0.0
+    seed_up_done: bool = False
+    seed_down_done: bool = False
+    btc_anchor_usd: float | None = None
+
+
 class Cheap03FirstEngine:
     def __init__(self, config: BotConfig, locator: GammaMarketLocator, trader: PolymarketTrader) -> None:
         self.config = config
@@ -131,12 +147,15 @@ class Cheap03FirstEngine:
             self.thr = float(os.getenv("BOT_CHEAP03_PRICE_MAX", "0.03"))
         self._limit_buy_px: float = float(os.getenv("BOT_CHEAP03_LIMIT_PX", "0.03"))
         self._limit_buy_shares: int = int(os.getenv("BOT_CHEAP03_LIMIT_SHARES", "34"))
-        self._seed_up_done: bool = False
-        self._seed_down_done: bool = False
-        self._btc_anchor_usd: float | None = None
+        self._lanes: dict[int, _LaneState] = {
+            int(wm): _LaneState() for wm in self.config.window_minutes_tokens
+        }
 
-    def _emit_init(self, contract: ActiveContract | None) -> None:
-        slug = contract.slug if contract else "(no contract yet)"
+    def _emit_init(self) -> None:
+        lane_slugs: list[str] = []
+        for wm in self.config.window_minutes_tokens:
+            c = self.locator.get_active_contract_for_window_minutes(int(wm))
+            lane_slugs.append(f"{wm}m={c.slug if c else '(none)'}")
         if self._entry_btc50_1c:
             mode = f"btc50_1c|btc_move<{self._btc_max_move_usd:g}|tp={self._tp_limit_px:g}"
         elif self._entry_dual_limits:
@@ -145,7 +164,7 @@ class Cheap03FirstEngine:
             mode = "market_fak"
         _out(
             "INIT "
-            f"strategy=first_cheap_03 window={self.config.window_minutes}m slug={slug} "
+            f"strategy=first_cheap_03 lanes={'+'.join(lane_slugs)} "
             f"entry={mode} thr={self.thr:g} notional_usdc={self.notional:g} "
             f"limit_px={self._limit_buy_px:g} limit_shares={self._limit_buy_shares} "
             f"dry_run={self.config.dry_run} funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
@@ -154,14 +173,14 @@ class Cheap03FirstEngine:
     def _emit_win(self, slug: str, side: Side) -> None:
         _out(f"WIN slug={slug} side={side}")
 
-    def _try_resolve_pending(self, current_slug: str) -> None:
-        if self._pending is None:
+    def _try_resolve_pending(self, st: _LaneState, current_slug: str) -> None:
+        if st.pending is None:
             return
-        if self._pending.slug == current_slug:
+        if st.pending.slug == current_slug:
             return
         # Previous window ended — resolve when Gamma marks closed
-        slug = self._pending.slug
-        want = self._pending.side
+        slug = st.pending.slug
+        want = st.pending.side
         try:
             w = _gamma_winner(self.session, slug, self.config.request_timeout_seconds)
         except Exception:
@@ -170,16 +189,18 @@ class Cheap03FirstEngine:
             return
         if w == want:
             self._emit_win(slug, want)
-        self._pending = None
+        st.pending = None
 
-    def _maybe_sync_tp_limits(self, contract: ActiveContract, *, force: bool = False) -> None:
+    def _maybe_sync_tp_limits(
+        self, contract: ActiveContract, st: _LaneState, *, force: bool = False
+    ) -> None:
         now = time.monotonic()
-        if not force and (now - self._last_tp_sync_monotonic) < self._tp_poll_seconds:
+        if not force and (now - st.last_tp_sync_monotonic) < self._tp_poll_seconds:
             return
         self.trader.sync_tp_limit_sells(
             contract, tp=self._tp_limit_px, dry_run=self.config.dry_run
         )
-        self._last_tp_sync_monotonic = now
+        st.last_tp_sync_monotonic = now
 
     def _fetch_binance_btc_spot(self) -> float | None:
         if not self.config.btc_feed_enabled:
@@ -197,15 +218,15 @@ class Cheap03FirstEngine:
             LOGGER.warning("[BTC50] Binance %s price fetch failed: %s", sym, exc)
             return None
 
-    def _ensure_btc_anchor(self) -> None:
-        if self._btc_anchor_usd is not None:
+    def _ensure_btc_anchor(self, st: _LaneState, wm: int) -> None:
+        if st.btc_anchor_usd is not None:
             return
         px = self._fetch_binance_btc_spot()
         if px is not None:
-            self._btc_anchor_usd = px
-            LOGGER.info("[BTC50] anchor spot=%.2f %s", px, self.config.btc_feed_symbol)
+            st.btc_anchor_usd = px
+            LOGGER.info("[BTC50] %dm anchor spot=%.2f %s", wm, px, self.config.btc_feed_symbol)
 
-    def _try_seed_dual_buy_limits(self, contract: ActiveContract) -> None:
+    def _try_seed_dual_buy_limits(self, contract: ActiveContract, st: _LaneState) -> None:
         """Resting GTC bids at ``_limit_buy_px`` on UP and DOWN (``cheap03_dual``-style)."""
         lim = round(float(self._limit_buy_px), 2)
         sh = int(self._limit_buy_shares)
@@ -215,20 +236,20 @@ class Cheap03FirstEngine:
             ("UP", contract.up, "up"),
             ("DOWN", contract.down, "down"),
         ):
-            done = self._seed_up_done if flag == "up" else self._seed_down_done
+            done = st.seed_up_done if flag == "up" else st.seed_down_done
             if done:
                 continue
             if self.config.dry_run:
                 if flag == "up":
-                    self._seed_up_done = True
+                    st.seed_up_done = True
                 else:
-                    self._seed_down_done = True
+                    st.seed_down_done = True
                 continue
             if self.trader.has_open_limit_buy_near(token.token_id, lim):
                 if flag == "up":
-                    self._seed_up_done = True
+                    st.seed_up_done = True
                 else:
-                    self._seed_down_done = True
+                    st.seed_down_done = True
                 LOGGER.info(
                     "[CHEAP03_ENTRY] %s | %s | existing BUY ~$%.2f on book",
                     contract.slug,
@@ -239,9 +260,9 @@ class Cheap03FirstEngine:
             try:
                 self.trader.place_limit_buy(token, lim, sh)
                 if flag == "up":
-                    self._seed_up_done = True
+                    st.seed_up_done = True
                 else:
-                    self._seed_down_done = True
+                    st.seed_down_done = True
                 LOGGER.info(
                     "[CHEAP03_ENTRY] %s | placed BUY limit %s $%.2f x %d",
                     contract.slug,
@@ -259,156 +280,144 @@ class Cheap03FirstEngine:
                     exc,
                 )
 
+    def _process_lane(self, wm: int, st: _LaneState, contract: ActiveContract) -> None:
+        cur_slug = contract.slug
+        if st.last_slug != cur_slug:
+            self._try_resolve_pending(st, cur_slug)
+            st.last_slug = cur_slug
+            st.fired_this_slug = False
+            st.last_tp_sync_monotonic = 0.0
+            st.seed_up_done = False
+            st.seed_down_done = False
+            st.btc_anchor_usd = None
+
+        self._maybe_sync_tp_limits(contract, st)
+        if self._entry_btc50_1c and st.fired_this_slug:
+            self._maybe_sync_tp_limits(contract, st, force=True)
+
+        if self._entry_dual_limits:
+            self._try_seed_dual_buy_limits(contract, st)
+            if not (st.seed_up_done and st.seed_down_done):
+                return
+            self._maybe_sync_tp_limits(contract, st, force=True)
+            return
+
+        if self._entry_btc50_1c:
+            self._ensure_btc_anchor(st, wm)
+            if st.fired_this_slug:
+                return
+            mu = self.trader.get_midpoint(contract.up.token_id)
+            md = self.trader.get_midpoint(contract.down.token_id)
+            if mu is None or md is None:
+                return
+            side = _cheap_side_at(float(mu), float(md), self.thr)
+            if side is None:
+                return
+            btc_now = self._fetch_binance_btc_spot()
+            if st.btc_anchor_usd is None:
+                if btc_now is not None:
+                    st.btc_anchor_usd = btc_now
+                    LOGGER.info("[BTC50] %dm anchor set at first cheap=%.2f", wm, btc_now)
+                else:
+                    return
+            if btc_now is None:
+                return
+            move = abs(btc_now - st.btc_anchor_usd)
+            if move >= self._btc_max_move_usd - 1e-9:
+                LOGGER.info(
+                    "[BTC50] %dm %s | skip first cheap | |move|=%.2f >= %.0f anchor=%.2f now=%.2f",
+                    wm,
+                    cur_slug,
+                    move,
+                    self._btc_max_move_usd,
+                    st.btc_anchor_usd,
+                    btc_now,
+                )
+                st.fired_this_slug = True
+                return
+
+            token = contract.up if side == "up" else contract.down
+            entry = float(mu) if side == "up" else float(md)
+            if self.config.dry_run:
+                st.fired_this_slug = True
+                return
+            try:
+                self.trader.place_market_buy_usdc_with_result(
+                    token,
+                    float(self.notional),
+                    confirm_get_order=self.config.polymarket_fak_confirm_get_order,
+                )
+            except Exception:
+                time.sleep(max(2.0, self.config.poll_interval_seconds))
+                return
+            st.fired_this_slug = True
+            st.pending = _OpenTrade(
+                slug=cur_slug,
+                side=side,
+                token_id=token.token_id,
+                notional_usdc=float(self.notional),
+            )
+            self._maybe_sync_tp_limits(contract, st, force=True)
+            _ = entry
+            return
+
+        if st.fired_this_slug:
+            return
+
+        mu = self.trader.get_midpoint(contract.up.token_id)
+        md = self.trader.get_midpoint(contract.down.token_id)
+        if mu is None or md is None:
+            return
+
+        side = _cheap_side_at(float(mu), float(md), self.thr)
+        if side is None:
+            return
+
+        token: TokenMarket = contract.up if side == "up" else contract.down
+        entry = float(mu) if side == "up" else float(md)
+
+        if self.config.dry_run:
+            st.fired_this_slug = True
+            return
+
+        try:
+            self.trader.place_market_buy_usdc_with_result(
+                token,
+                float(self.notional),
+                confirm_get_order=self.config.polymarket_fak_confirm_get_order,
+            )
+        except Exception:
+            time.sleep(max(2.0, self.config.poll_interval_seconds))
+            return
+
+        st.fired_this_slug = True
+        st.pending = _OpenTrade(
+            slug=cur_slug,
+            side=side,
+            token_id=token.token_id,
+            notional_usdc=float(self.notional),
+        )
+        self._maybe_sync_tp_limits(contract, st, force=True)
+        _ = entry
+
     def run(self) -> None:
-        contract0 = self.locator.get_active_contract()
-        self._emit_init(contract0)
+        self._emit_init()
 
         while True:
             try:
-                contract = self.locator.get_active_contract()
-                if contract is None:
+                saw_any = False
+                for wm in self.config.window_minutes_tokens:
+                    st = self._lanes[int(wm)]
+                    contract = self.locator.get_active_contract_for_window_minutes(int(wm))
+                    if contract is None:
+                        continue
+                    saw_any = True
+                    self._process_lane(int(wm), st, contract)
+                if not saw_any:
                     time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                cur_slug = contract.slug
-                if self._last_slug != cur_slug:
-                    self._try_resolve_pending(cur_slug)
-                    self._last_slug = cur_slug
-                    self._fired_this_slug = False
-                    # New window: do not inherit the 15s TP gate from the previous market's tokens.
-                    self._last_tp_sync_monotonic = 0.0
-                    self._seed_up_done = False
-                    self._seed_down_done = False
-                    self._btc_anchor_usd = None
-
-                # Must run *before* ``_fired_this_slug`` continue — otherwise after a fill we never
-                # poll TP again (balance lag / transient place failure would leave no resting sells).
-                self._maybe_sync_tp_limits(contract)
-                if self._entry_btc50_1c and self._fired_this_slug:
-                    self._maybe_sync_tp_limits(contract, force=True)
-
-                if self._entry_dual_limits:
-                    self._try_seed_dual_buy_limits(contract)
-                    if not (self._seed_up_done and self._seed_down_done):
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    # After both bids rest, re-check TP every poll (fills can land anytime).
-                    self._maybe_sync_tp_limits(contract, force=True)
+                else:
                     time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                if self._entry_btc50_1c:
-                    self._ensure_btc_anchor()
-                    if self._fired_this_slug:
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    mu = self.trader.get_midpoint(contract.up.token_id)
-                    md = self.trader.get_midpoint(contract.down.token_id)
-                    if mu is None or md is None:
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    side = _cheap_side_at(float(mu), float(md), self.thr)
-                    if side is None:
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    btc_now = self._fetch_binance_btc_spot()
-                    if self._btc_anchor_usd is None:
-                        if btc_now is not None:
-                            self._btc_anchor_usd = btc_now
-                            LOGGER.info("[BTC50] anchor set at first cheap=%.2f", btc_now)
-                        else:
-                            time.sleep(self.config.poll_interval_seconds)
-                            continue
-                    if btc_now is None:
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    move = abs(btc_now - self._btc_anchor_usd)
-                    if move >= self._btc_max_move_usd - 1e-9:
-                        LOGGER.info(
-                            "[BTC50] %s | skip first cheap | |move|=%.2f >= %.0f anchor=%.2f now=%.2f",
-                            cur_slug,
-                            move,
-                            self._btc_max_move_usd,
-                            self._btc_anchor_usd,
-                            btc_now,
-                        )
-                        self._fired_this_slug = True
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-
-                    token = contract.up if side == "up" else contract.down
-                    entry = float(mu) if side == "up" else float(md)
-                    if self.config.dry_run:
-                        self._fired_this_slug = True
-                        time.sleep(self.config.poll_interval_seconds)
-                        continue
-                    try:
-                        self.trader.place_market_buy_usdc_with_result(
-                            token,
-                            float(self.notional),
-                            confirm_get_order=self.config.polymarket_fak_confirm_get_order,
-                        )
-                    except Exception:
-                        time.sleep(max(2.0, self.config.poll_interval_seconds))
-                        continue
-                    self._fired_this_slug = True
-                    self._pending = _OpenTrade(
-                        slug=cur_slug,
-                        side=side,
-                        token_id=token.token_id,
-                        notional_usdc=float(self.notional),
-                    )
-                    self._maybe_sync_tp_limits(contract, force=True)
-                    _ = entry
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                if self._fired_this_slug:
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                mu = self.trader.get_midpoint(contract.up.token_id)
-                md = self.trader.get_midpoint(contract.down.token_id)
-                if mu is None or md is None:
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                side = _cheap_side_at(float(mu), float(md), self.thr)
-                if side is None:
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                token: TokenMarket = contract.up if side == "up" else contract.down
-                entry = float(mu) if side == "up" else float(md)
-
-                if self.config.dry_run:
-                    self._fired_this_slug = True
-                    time.sleep(self.config.poll_interval_seconds)
-                    continue
-
-                try:
-                    self.trader.place_market_buy_usdc_with_result(
-                        token,
-                        float(self.notional),
-                        confirm_get_order=self.config.polymarket_fak_confirm_get_order,
-                    )
-                except Exception:
-                    time.sleep(max(2.0, self.config.poll_interval_seconds))
-                    continue
-
-                self._fired_this_slug = True
-                self._pending = _OpenTrade(
-                    slug=cur_slug,
-                    side=side,
-                    token_id=token.token_id,
-                    notional_usdc=float(self.notional),
-                )
-                self._maybe_sync_tp_limits(contract, force=True)
-                _ = entry
             except KeyboardInterrupt:
                 raise
             except Exception:
-                # Silent on errors (user asked minimal logs); exit non-zero from main if desired
                 time.sleep(max(2.0, self.config.poll_interval_seconds))
-            else:
-                time.sleep(self.config.poll_interval_seconds)

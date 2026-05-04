@@ -31,6 +31,29 @@ class BotConfigError(RuntimeError):
     pass
 
 
+def _parse_window_minutes_tokens(raw: str | None) -> tuple[int, ...]:
+    """Parse ``BOT_WINDOW_MINUTES``: ``15`` or ``5,15`` (order preserved, deduped)."""
+    s = (raw or "").strip()
+    if not s:
+        return (15,)
+    out: list[int] = []
+    seen: set[int] = set()
+    for part in s.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part, 10)
+        except ValueError as exc:
+            raise BotConfigError(
+                f"BOT_WINDOW_MINUTES contains non-integer segment {part!r}."
+            ) from exc
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return tuple(out) if out else (15,)
+
+
 def _strip_env_copy_artifacts(value: str) -> str:
     """Remove stray prefixes from pasted env values (e.g. `.git0x...` from a broken .env line)."""
     s = value.strip().strip('"').strip("'")
@@ -114,7 +137,8 @@ class BotConfig:
     order_cooldown_seconds: float = 3.0
     hedge_offset: float = 0.02
     market_symbol: str = "BTC"
-    window_minutes: int = 15
+    # One or more candle lengths (e.g. ``(15,)`` or ``(5, 15)``). ``first_cheap_03`` runs each in-process.
+    window_minutes_tokens: tuple[int, ...] = (15,)
     # Unused by ``GammaMarketLocator`` (kept for env compatibility): old grace flipped to next slug mid-window.
     window_pick_current_grace_seconds: int = 300
     trade_one_window: bool = False
@@ -294,6 +318,11 @@ class BotConfig:
     shaman_v1_min_notional_usdc: float = 1.0
 
     @property
+    def window_minutes(self) -> int:
+        """First listed window length (legacy / slug prefix for tools that assume one)."""
+        return self.window_minutes_tokens[0]
+
+    @property
     def window_size_seconds(self) -> int:
         return self.window_minutes * 60
 
@@ -345,6 +374,7 @@ class BotConfig:
             perp15_ladder = [0.44, 0.43, 0.40]
 
         raw_mode = _normalize_strategy_mode(os.getenv("BOT_STRATEGY_MODE", "shaman_v1"))
+        window_minutes_tokens = _parse_window_minutes_tokens(os.getenv("BOT_WINDOW_MINUTES"))
         default_strategy_budget = (
             400.0
             if raw_mode == "paladin_v9"
@@ -377,7 +407,7 @@ class BotConfig:
             order_cooldown_seconds=_env_float("BOT_ORDER_COOLDOWN_SECONDS", 3.0),
             hedge_offset=_env_float("BOT_HEDGE_OFFSET", 0.02),
             market_symbol=os.getenv("BOT_MARKET_SYMBOL", "BTC").upper(),
-            window_minutes=_env_int("BOT_WINDOW_MINUTES", 15),
+            window_minutes_tokens=window_minutes_tokens,
             window_pick_current_grace_seconds=_env_int("BOT_WINDOW_PICK_CURRENT_GRACE_SECONDS", 300),
             trade_one_window=_env_bool("BOT_TRADE_ONE_WINDOW", False),
             strategy_budget_cap_usdc=_env_float("BOT_STRATEGY_BUDGET_CAP_USDC", default_strategy_budget),
@@ -626,11 +656,22 @@ class BotConfig:
                 f"BOT_STRATEGY_MIN_BUDGET_USDC ({cfg.strategy_min_budget_usdc}) for strategy_mode="
                 f"{cfg.strategy_mode!r}"
             )
-        if cfg.strategy_mode == "first_cheap_03" and cfg.window_minutes not in (5, 15):
+        if len(cfg.window_minutes_tokens) > 1 and cfg.strategy_mode != "first_cheap_03":
             raise BotConfigError(
-                "BOT_WINDOW_MINUTES for first_cheap_03 must be 5 or 15 "
-                f"(Gamma slug btc-updown-{{5|15}}m-<epoch>; got {cfg.window_minutes})."
+                "Comma-separated BOT_WINDOW_MINUTES is only supported for "
+                f"BOT_STRATEGY_MODE=first_cheap_03 (got {cfg.strategy_mode!r})."
             )
+        if cfg.strategy_mode == "first_cheap_03":
+            for wm in cfg.window_minutes_tokens:
+                if wm not in (5, 15):
+                    raise BotConfigError(
+                        "BOT_WINDOW_MINUTES for first_cheap_03 must list only 5 and/or 15 "
+                        f"(Gamma btc-updown-{{5|15}}m-<epoch>); got segment {wm!r}."
+                    )
+            if len(cfg.window_minutes_tokens) > 2:
+                raise BotConfigError(
+                    "BOT_WINDOW_MINUTES: at most two entries (5 and 15) for first_cheap_03."
+                )
         return cfg
 
 

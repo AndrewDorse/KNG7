@@ -1,8 +1,8 @@
 # KNG7 — `first_cheap_03` (Docker)
 
-One **BTC 5m or 15m UP/DOWN** market at a time (Gamma slug `btc-updown-5m-<epoch>` or `btc-updown-15m-<epoch>`). Set **`BOT_WINDOW_MINUTES=5`** or **`15`** (other values are rejected for this strategy). Same **`btc50_1c`** rules: 1¢ first touch, Binance BTC move vs anchor **\< \$50**, **\$1** FAK, TP **70¢** (defaults below).
+**Gamma** slugs `btc-updown-5m-<epoch>` and/or `btc-updown-15m-<epoch>`. Set **`BOT_WINDOW_MINUTES`** to **`15`**, **`5`**, or **`5,15`** (comma-separated; order is lane priority in the poll loop). Same **`btc50_1c`** rules per lane: 1¢ first touch, Binance BTC move vs anchor **\< \$50**, **\$1** FAK, TP **70¢** (defaults below).
 
-**Not simultaneous in one process:** a single container follows **one** `BOT_WINDOW_MINUTES`. If logs only show `btc-updown-15m-…`, your `.env` still has **`BOT_WINDOW_MINUTES=15`** (the default). To trade **5m only**, set **`BOT_WINDOW_MINUTES=5`** and redeploy. To run **both 5m and 15m at once**, use two containers — e.g. **`docker compose --profile five_m up -d`**, which starts the default **`bot`** (uses `.env`) plus **`bot_5m`** (Compose overrides window minutes to **5**). Both share the same **`.env` keys**; treat that as **double live risk** unless you split wallets/projects.
+**Both in one process:** **`BOT_WINDOW_MINUTES=5,15`** (default in `.env.example`) runs **two independent lanes** in a single Python loop—separate anchors, first-cheap flags, TP sync, and pending-resolution per length. **`INIT`** prints both slugs, e.g. `lanes=5m=btc-updown-5m-…+15m=btc-updown-15m-…`. Logs use **`[BTC50] 5m`** / **`[BTC50] 15m`** where relevant. Same wallet for both lanes = **combined exposure**.
 
 ## Default behavior (`BOT_CHEAP03_ENTRY=btc50_1c`)
 
@@ -31,7 +31,7 @@ Legacy: first **≤ `BOT_CHEAP03_PRICE_MAX`** (default **3¢**) touch → **\$1*
 
 1. `cp .env.example .env` — set keys and **`POLY_DRY_RUN=false`** when going live.
 2. **`BOT_STRATEGY_MODE=first_cheap_03`**.
-3. For default strategy: **`BOT_CHEAP03_ENTRY=btc50_1c`**, **`BOT_BTC_MAX_MOVE_USD=50`**, **`BOT_TP_LIMIT_PX=0.70`**, **`BOT_CHEAP03_PRICE_MAX=0.01`**, and **`BOT_WINDOW_MINUTES`** (**`5`** or **`15`**).
+3. For default strategy: **`BOT_CHEAP03_ENTRY=btc50_1c`**, **`BOT_BTC_MAX_MOVE_USD=50`**, **`BOT_TP_LIMIT_PX=0.70`**, **`BOT_CHEAP03_PRICE_MAX=0.01`**, and **`BOT_WINDOW_MINUTES`** (**`15`**, **`5`**, or **`5,15`** for both).
 4. Ensure outbound HTTPS to **api.binance.com** (or set **`BOT_BTC_FEED_ENABLED=false`** only if you accept disabling the gate — not recommended for `btc50_1c`).
 5. `docker compose build && docker compose up -d`
 6. `docker compose logs -f bot`

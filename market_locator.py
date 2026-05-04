@@ -45,27 +45,13 @@ class GammaMarketLocator:
     def __init__(self, config: BotConfig):
         self.config = config
         self.session = create_polymarket_session()
-        self._cached_contract: ActiveContract | None = None
-        self._cache_expires_at = 0.0
         # SHAMAN (and similar): separate Gamma slugs per window length, e.g. btc-updown-5m-* vs btc-updown-15m-*
         self._contract_by_window_min: dict[int, tuple[ActiveContract | None, float]] = {}
 
     def get_active_contract(self) -> ActiveContract | None:
-        now = time.time()
-        now_dt = datetime.now(timezone.utc)
-        if (
-            self._cached_contract is not None
-            and self._cached_contract.end_time > now_dt
-        ):
-            cached_start = self._cached_contract.end_time.timestamp() - self.config.window_size_seconds
-            if now >= cached_start or now < self._cache_expires_at:
-                return self._cached_contract
-
-        contract = self._discover()
-        if contract:
-            self._cached_contract = contract
-            self._cache_expires_at = now + 30.0
-        return contract
+        """Legacy single-window API: first entry in ``BOT_WINDOW_MINUTES`` (comma list)."""
+        wm = int(self.config.window_minutes_tokens[0])
+        return self.get_active_contract_for_window_minutes(wm)
 
     def get_active_contract_for_window_minutes(self, window_minutes: int) -> ActiveContract | None:
         """Resolve UP/DOWN market for a specific candle window (5 vs 15), independent of ``BOT_WINDOW_MINUTES``."""
@@ -94,33 +80,6 @@ class GammaMarketLocator:
         target_start = current_start
         sym = self.config.market_symbol.lower()
         slug = f"{sym}-updown-{window_minutes}m-{target_start}"
-        resp = self.session.get(
-            f"{GAMMA_URL}/markets",
-            params={"slug": slug},
-            timeout=self.config.request_timeout_seconds,
-        )
-        resp.raise_for_status()
-        markets = resp.json()
-        if not markets:
-            return None
-        return self._parse(markets[0], now)
-
-    @_retry(max_attempts=5, backoff_base=0.75)
-    def _discover(self) -> ActiveContract | None:
-        now = datetime.now(timezone.utc)
-        now_ts = int(now.timestamp())
-        window_size = self.config.window_size_seconds
-        current_start = (now_ts // window_size) * window_size
-        # Always pick the slug for the window epoch that *contains* ``now`` (floor to window_size).
-        #
-        # Older logic used ``window_pick_current_grace_seconds``: after ``grace`` seconds inside the
-        # epoch it requested ``current_start + window_size`` (the *next* Gamma slug). That runs for
-        # ~10 minutes of every 15m block while the *current* market is still live — the bot then
-        # "moved to the next window" mid-period, reset strategy state, and sat in pre-window while
-        # positions stayed on the previous contract.
-        target_start = current_start
-
-        slug = f"{self.config.market_slug_prefix}-{target_start}"
         resp = self.session.get(
             f"{GAMMA_URL}/markets",
             params={"slug": slug},

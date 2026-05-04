@@ -9,7 +9,7 @@ import sys
 
 
 def _configure_logging() -> None:
-    """Keep noisy HTTP/SDK loggers quiet; surface our bot logger for live ops (entry + TP lines)."""
+    """Keep HTTP/SDK quiet. App logger defaults to ERROR (only errors); INIT/DEAL/WIN go to stdout."""
     for name in (
         "urllib3",
         "requests",
@@ -21,7 +21,7 @@ def _configure_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
     app = logging.getLogger("polymarket_btc_ladder")
-    level_name = (os.getenv("BOT_LOG_LEVEL") or "INFO").strip().upper()
+    level_name = (os.getenv("BOT_LOG_LEVEL") or "ERROR").strip().upper()
     app.setLevel(getattr(logging, level_name, logging.INFO))
     if not app.handlers:
         h = logging.StreamHandler(sys.stderr)

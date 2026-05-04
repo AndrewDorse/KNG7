@@ -1049,31 +1049,42 @@ class PolymarketTrader:
             return None
 
     def get_best_bid(self, token_id: str) -> float | None:
-        """Get highest bid price — what we'd receive selling right now.
-
-        Useful for assessing liquidation value of unpaired positions."""
+        """Highest bid — scans the book; CLOB bids are not guaranteed sorted best-first."""
         try:
             book = self.get_order_book(token_id)
             bids = book.get("bids") or []
-            if bids:
-                price = float(bids[0].get("price", 0))
-                return price if price > 0 else None
-            return None
+            if not bids:
+                return None
+            best: float | None = None
+            for b in bids:
+                p = float(b.get("price", 0) or 0)
+                if p > 0 and (best is None or p > best):
+                    best = p
+            return best
         except Exception:
             return None
 
     def get_midpoint(self, token_id: str) -> float | None:
-        """Get current midpoint price for a token from the orderbook.
-        Returns None if orderbook is empty or unavailable."""
+        """Mid from **best** bid and **best** ask (same rules as get_best_bid / get_best_ask).
+
+        Using ``[0]`` is unsafe: Polymarket CLOB book entries are not guaranteed sorted."""
         try:
             book = self.get_order_book(token_id)
             bids = book.get("bids") or []
             asks = book.get("asks") or []
             if not bids or not asks:
                 return None
-            best_bid = float(bids[0].get("price", 0))
-            best_ask = float(asks[0].get("price", 0))
-            if best_bid <= 0 or best_ask <= 0:
+            best_bid: float | None = None
+            for b in bids:
+                p = float(b.get("price", 0) or 0)
+                if p > 0 and (best_bid is None or p > best_bid):
+                    best_bid = p
+            best_ask: float | None = None
+            for a in asks:
+                p = float(a.get("price", 0) or 0)
+                if p > 0 and (best_ask is None or p < best_ask):
+                    best_ask = p
+            if best_bid is None or best_ask is None:
                 return None
             return (best_bid + best_ask) / 2.0
         except Exception:

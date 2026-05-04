@@ -215,7 +215,7 @@ class Cheap03FirstEngine:
             r.raise_for_status()
             return float(r.json()["price"])
         except Exception as exc:
-            LOGGER.warning("[BTC50] Binance %s price fetch failed: %s", sym, exc)
+            LOGGER.error("[BTC50] Binance %s price fetch failed: %s", sym, exc)
             return None
 
     def _ensure_btc_anchor(self, st: _LaneState, wm: int) -> None:
@@ -224,7 +224,6 @@ class Cheap03FirstEngine:
         px = self._fetch_binance_btc_spot()
         if px is not None:
             st.btc_anchor_usd = px
-            LOGGER.info("[BTC50] %dm anchor spot=%.2f %s", wm, px, self.config.btc_feed_symbol)
 
     def _try_seed_dual_buy_limits(self, contract: ActiveContract, st: _LaneState) -> None:
         """Resting GTC bids at ``_limit_buy_px`` on UP and DOWN (``cheap03_dual``-style)."""
@@ -250,12 +249,6 @@ class Cheap03FirstEngine:
                     st.seed_up_done = True
                 else:
                     st.seed_down_done = True
-                LOGGER.info(
-                    "[CHEAP03_ENTRY] %s | %s | existing BUY ~$%.2f on book",
-                    contract.slug,
-                    outcome,
-                    lim,
-                )
                 continue
             try:
                 self.trader.place_limit_buy(token, lim, sh)
@@ -263,15 +256,12 @@ class Cheap03FirstEngine:
                     st.seed_up_done = True
                 else:
                     st.seed_down_done = True
-                LOGGER.info(
-                    "[CHEAP03_ENTRY] %s | placed BUY limit %s $%.2f x %d",
-                    contract.slug,
-                    outcome,
-                    lim,
-                    sh,
+                _out(
+                    f"DEAL_START slug={contract.slug} mode=dual_limits "
+                    f"side={outcome} limit_px={lim:g} shares={sh}"
                 )
             except Exception as exc:
-                LOGGER.warning(
+                LOGGER.error(
                     "[CHEAP03_ENTRY] %s | %s BUY $%.2f x %d failed: %s",
                     contract.slug,
                     outcome,
@@ -317,22 +307,12 @@ class Cheap03FirstEngine:
             if st.btc_anchor_usd is None:
                 if btc_now is not None:
                     st.btc_anchor_usd = btc_now
-                    LOGGER.info("[BTC50] %dm anchor set at first cheap=%.2f", wm, btc_now)
                 else:
                     return
             if btc_now is None:
                 return
             move = abs(btc_now - st.btc_anchor_usd)
             if move >= self._btc_max_move_usd - 1e-9:
-                LOGGER.info(
-                    "[BTC50] %dm %s | skip first cheap | |move|=%.2f >= %.0f anchor=%.2f now=%.2f",
-                    wm,
-                    cur_slug,
-                    move,
-                    self._btc_max_move_usd,
-                    st.btc_anchor_usd,
-                    btc_now,
-                )
                 st.fired_this_slug = True
                 return
 
@@ -347,7 +327,14 @@ class Cheap03FirstEngine:
                     float(self.notional),
                     confirm_get_order=self.config.polymarket_fak_confirm_get_order,
                 )
-            except Exception:
+            except Exception as exc:
+                LOGGER.error(
+                    "[BTC50] %dm %s market buy failed side=%s: %s",
+                    wm,
+                    cur_slug,
+                    side,
+                    exc,
+                )
                 time.sleep(max(2.0, self.config.poll_interval_seconds))
                 return
             st.fired_this_slug = True
@@ -358,7 +345,10 @@ class Cheap03FirstEngine:
                 notional_usdc=float(self.notional),
             )
             self._maybe_sync_tp_limits(contract, st, force=True)
-            _ = entry
+            _out(
+                f"DEAL_START slug={cur_slug} mode=btc50_1c side={side.upper()} "
+                f"mid~={entry:g} notional_usdc={self.notional:g}"
+            )
             return
 
         if st.fired_this_slug:
@@ -386,7 +376,13 @@ class Cheap03FirstEngine:
                 float(self.notional),
                 confirm_get_order=self.config.polymarket_fak_confirm_get_order,
             )
-        except Exception:
+        except Exception as exc:
+            LOGGER.error(
+                "[CHEAP03] %s market buy failed side=%s: %s",
+                cur_slug,
+                side,
+                exc,
+            )
             time.sleep(max(2.0, self.config.poll_interval_seconds))
             return
 
@@ -398,6 +394,10 @@ class Cheap03FirstEngine:
             notional_usdc=float(self.notional),
         )
         self._maybe_sync_tp_limits(contract, st, force=True)
+        _out(
+            f"DEAL_START slug={cur_slug} mode=market_fak side={side.upper()} "
+            f"mid~={entry:g} notional_usdc={self.notional:g}"
+        )
         _ = entry
 
     def run(self) -> None:
@@ -420,4 +420,5 @@ class Cheap03FirstEngine:
             except KeyboardInterrupt:
                 raise
             except Exception:
+                LOGGER.exception("KNG7 main loop error")
                 time.sleep(max(2.0, self.config.poll_interval_seconds))

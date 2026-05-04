@@ -54,6 +54,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if config.dry_run:
+        logging.getLogger("polymarket_btc_ladder").error(
+            "POLY_DRY_RUN=true: bot will NOT place real orders. "
+            "Set POLY_DRY_RUN=false for live trading."
+        )
 
     locator = GammaMarketLocator(config)
     trader = PolymarketTrader(config)

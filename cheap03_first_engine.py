@@ -116,6 +116,11 @@ class _LaneState:
     btc_anchor_usd: float | None = None
     # dual_limits: run TP sync once when both resting bids are in place (not every poll).
     dual_tp_synced_once: bool = False
+    # Diagnostics for "silent no-trade" windows.
+    no_mid_streak: int = 0
+    no_btc_streak: int = 0
+    mid_error_logged: bool = False
+    btc_error_logged: bool = False
 
 
 class Cheap03FirstEngine:
@@ -285,6 +290,10 @@ class Cheap03FirstEngine:
             st.seed_down_done = False
             st.btc_anchor_usd = None
             st.dual_tp_synced_once = False
+            st.no_mid_streak = 0
+            st.no_btc_streak = 0
+            st.mid_error_logged = False
+            st.btc_error_logged = False
 
         self._maybe_sync_tp_limits(contract, st)
 
@@ -304,7 +313,18 @@ class Cheap03FirstEngine:
             mu = self.trader.get_midpoint(contract.up.token_id)
             md = self.trader.get_midpoint(contract.down.token_id)
             if mu is None or md is None:
+                st.no_mid_streak += 1
+                if st.no_mid_streak >= 30 and not st.mid_error_logged:
+                    st.mid_error_logged = True
+                    LOGGER.error(
+                        "[DATA] %dm %s no midpoint for 30+ polls (ws=%s). Check CLOB feed/network.",
+                        wm,
+                        cur_slug,
+                        "on" if self.trader.ws_quotes_active else "off",
+                    )
                 return
+            st.no_mid_streak = 0
+            st.mid_error_logged = False
             side = _cheap_side_at(float(mu), float(md), self.thr)
             if side is None:
                 return
@@ -313,11 +333,38 @@ class Cheap03FirstEngine:
                 if btc_now is not None:
                     st.btc_anchor_usd = btc_now
                 else:
+                    st.no_btc_streak += 1
+                    if st.no_btc_streak >= 10 and not st.btc_error_logged:
+                        st.btc_error_logged = True
+                        LOGGER.error(
+                            "[BTC50] %dm %s cannot set BTC anchor: Binance feed unavailable for 10+ polls.",
+                            wm,
+                            cur_slug,
+                        )
                     return
             if btc_now is None:
+                st.no_btc_streak += 1
+                if st.no_btc_streak >= 10 and not st.btc_error_logged:
+                    st.btc_error_logged = True
+                    LOGGER.error(
+                        "[BTC50] %dm %s Binance feed unavailable for 10+ polls after cheap trigger.",
+                        wm,
+                        cur_slug,
+                    )
                 return
+            st.no_btc_streak = 0
+            st.btc_error_logged = False
             move = abs(btc_now - st.btc_anchor_usd)
             if move >= self._btc_max_move_usd - 1e-9:
+                LOGGER.error(
+                    "[BTC50] %dm %s first cheap blocked by BTC gate: move=%.2f >= %.2f (anchor=%.2f now=%.2f)",
+                    wm,
+                    cur_slug,
+                    move,
+                    self._btc_max_move_usd,
+                    st.btc_anchor_usd,
+                    btc_now,
+                )
                 st.fired_this_slug = True
                 return
 

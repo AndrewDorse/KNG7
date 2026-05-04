@@ -25,6 +25,7 @@ COPY trader.py /app/trader.py
 COPY market_locator.py /app/market_locator.py
 COPY http_session.py /app/http_session.py
 COPY clob_fak.py /app/clob_fak.py
+COPY polymarket_ws.py /app/polymarket_ws.py
 
 RUN mkdir -p /app/logs /app/exports && \
     chown -R appuser:appuser /app

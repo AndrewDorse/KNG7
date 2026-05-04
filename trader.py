@@ -178,6 +178,55 @@ class PolymarketTrader:
         # --- Token spending allowances (required before first trade) ---
         self._setup_allowances()
 
+        self._ws_feed: Any = None
+        if self.config.polymarket_ws_enabled:
+            try:
+                from polymarket_ws import MarketWsFeed
+
+                self._ws_feed = MarketWsFeed(self.config.polymarket_ws_url)
+                self._ws_feed.start()
+            except Exception as exc:
+                LOGGER.error(
+                    "Polymarket market WS disabled (start failed); using REST order book: %s",
+                    exc,
+                )
+                self._ws_feed = None
+
+    @property
+    def ws_quotes_active(self) -> bool:
+        return self._ws_feed is not None
+
+    def sync_ws_subscriptions(self, contracts: list[ActiveContract | None]) -> None:
+        """Point the market WebSocket at all UP/DOWN token IDs for active lanes (deduped)."""
+        if self._ws_feed is None:
+            return
+        ids: list[str] = []
+        seen: set[str] = set()
+        for c in contracts:
+            if c is None:
+                continue
+            for tok in (c.up, c.down):
+                tid = str(tok.token_id or "")
+                if tid and tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+        if not ids:
+            return
+        self._ws_feed.set_assets(ids)
+
+    def _ws_bid_ask_mid(self, token_id: str) -> tuple[float, float, float] | None:
+        if self._ws_feed is None:
+            return None
+        row = self._ws_feed.best_bid_ask_for(
+            token_id, max_age_sec=float(self.config.polymarket_ws_max_age_seconds)
+        )
+        if row is None:
+            return None
+        bid, ask = row
+        if bid <= 0 or ask <= 0:
+            return None
+        return bid, ask, (bid + ask) / 2.0
+
     # ------------------------------------------------------------------
     # Initialization helpers
     # ------------------------------------------------------------------
@@ -1026,10 +1075,11 @@ class PolymarketTrader:
     def get_best_ask(self, token_id: str) -> float | None:
         """Get lowest ask price — what it costs to buy right now.
 
-        Uses the **minimum** ask across the book; the CLOB does not always guarantee
-        sort order, and ``[0]`` is not always the best ask. Empty book → None (SHAMAN
-        then skips with ``PM_skip no_ask`` — common when the outcome has no offers yet).
+        Prefer Polymarket **market** WebSocket when enabled; else REST order book scan.
         """
+        ws = self._ws_bid_ask_mid(token_id)
+        if ws is not None:
+            return ws[1]
         try:
             book = self.get_order_book(token_id)
             asks = book.get("asks") or []
@@ -1045,7 +1095,10 @@ class PolymarketTrader:
             return None
 
     def get_best_bid(self, token_id: str) -> float | None:
-        """Highest bid — scans the book; CLOB bids are not guaranteed sorted best-first."""
+        """Highest bid — WebSocket first when enabled; else REST book scan."""
+        ws = self._ws_bid_ask_mid(token_id)
+        if ws is not None:
+            return ws[0]
         try:
             book = self.get_order_book(token_id)
             bids = book.get("bids") or []
@@ -1061,9 +1114,10 @@ class PolymarketTrader:
             return None
 
     def get_midpoint(self, token_id: str) -> float | None:
-        """Mid from **best** bid and **best** ask (same rules as get_best_bid / get_best_ask).
-
-        Using ``[0]`` is unsafe: Polymarket CLOB book entries are not guaranteed sorted."""
+        """Mid from best bid + best ask — WebSocket first when enabled; else REST book scan."""
+        ws = self._ws_bid_ask_mid(token_id)
+        if ws is not None:
+            return ws[2]
         try:
             book = self.get_order_book(token_id)
             bids = book.get("bids") or []

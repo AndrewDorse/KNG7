@@ -193,6 +193,8 @@ class BotConfig:
     # CLOB market WebSocket (PALADIN / low-latency quotes) + FAK fill confirmation
     polymarket_ws_enabled: bool = True
     polymarket_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    # Drop WS quote and fall back to REST book if older than this (seconds).
+    polymarket_ws_max_age_seconds: float = 4.0
     polymarket_fak_confirm_get_order: bool = True
     # PALADIN live (pair-only): primary goal is a low *held* pair cost (avg_up + avg_down after fills), not chasing
     # instantaneous pm_up+pm_down (often ~1.0 in an efficient book). Stagger second leg: default uses post-fill
@@ -458,6 +460,9 @@ class BotConfig:
             polymarket_ws_url=os.getenv(
                 "BOT_POLY_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
             ).strip(),
+            polymarket_ws_max_age_seconds=max(
+                0.5, _env_float("BOT_POLY_WS_MAX_AGE_SEC", 4.0)
+            ),
             polymarket_fak_confirm_get_order=_env_bool("BOT_POLY_FAK_CONFIRM_ORDER", True),
             paladin_pair_sum_max=_env_float("BOT_PALADIN_PAIR_SUM_MAX", 0.97),
             paladin_pair_sum_max_on_forced_hedge=(

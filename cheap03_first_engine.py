@@ -164,12 +164,14 @@ class Cheap03FirstEngine:
             mode = "dual_limits"
         else:
             mode = "market_fak"
+        poly_ws = "on" if self.trader.ws_quotes_active else "off"
         _out(
             "INIT "
             f"strategy=first_cheap_03 lanes={'+'.join(lane_slugs)} "
             f"entry={mode} thr={self.thr:g} notional_usdc={self.notional:g} "
             f"limit_px={self._limit_buy_px:g} limit_shares={self._limit_buy_shares} "
-            f"dry_run={self.config.dry_run} funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
+            f"poly_ws={poly_ws} dry_run={self.config.dry_run} "
+            f"funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
         )
 
     def _emit_win(self, slug: str, side: Side) -> None:
@@ -409,9 +411,14 @@ class Cheap03FirstEngine:
         while True:
             try:
                 saw_any = False
+                lane_contracts: list[ActiveContract | None] = []
                 for wm in self.config.window_minutes_tokens:
+                    lane_contracts.append(
+                        self.locator.get_active_contract_for_window_minutes(int(wm))
+                    )
+                self.trader.sync_ws_subscriptions(lane_contracts)
+                for wm, contract in zip(self.config.window_minutes_tokens, lane_contracts, strict=True):
                     st = self._lanes[int(wm)]
-                    contract = self.locator.get_active_contract_for_window_minutes(int(wm))
                     if contract is None:
                         continue
                     saw_any = True

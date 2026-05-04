@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from decimal import ROUND_DOWN, Decimal
@@ -55,6 +56,9 @@ from config import (
 _ORDER_VERSION_MISMATCH_SNIPPET = "order_version_mismatch"
 _BUY_RETRY_DELAY_SECONDS = 2.0
 _BUY_RETRY_ATTEMPTS = 3
+# FAK cap for USDC-sized buys: best ask + this (default 3¢), clamped to Polymarket max tick 0.99.
+_DEFAULT_MARKET_BUY_SLIPPAGE_USD = 0.03
+_CLOB_BUY_MAX_PX = 0.99
 
 
 def _is_order_version_mismatch_error(exc: Exception) -> bool:
@@ -475,6 +479,7 @@ class PolymarketTrader:
         *,
         confirm_get_order: bool = True,
         fee_rate_bps: int | None = None,
+        requested_usdc: float | None = None,
     ) -> Any:
         """Submit one FAK buy; parse POST body and optionally confirm fill via GET /order.
 
@@ -488,6 +493,7 @@ class PolymarketTrader:
                 size,
                 confirm_get_order=confirm_get_order,
                 fee_rate_bps=fee_rate_bps,
+                requested_usdc=requested_usdc,
             )
 
     def _place_marketable_buy_with_result_impl(
@@ -498,6 +504,7 @@ class PolymarketTrader:
         *,
         confirm_get_order: bool = True,
         fee_rate_bps: int | None = None,
+        requested_usdc: float | None = None,
     ) -> Any:
         from clob_fak import fak_buy_with_confirm
 
@@ -551,6 +558,7 @@ class PolymarketTrader:
             requested_shares=float(sz),
             limit_price=float(price),
             confirm=confirm_get_order,
+            requested_usdc=requested_usdc,
         )
 
     def place_market_buy_usdc(
@@ -620,7 +628,11 @@ class PolymarketTrader:
         confirm_get_order: bool = True,
         fee_rate_bps: int | None = None,
     ) -> Any:
-        """FAK market buy sized in **USDC**; signed price comes from the order book (py_clob_client)."""
+        """FAK buy for ``usdc`` budget: limit = **best ask + slippage** (default +3¢), capped at 0.99.
+
+        Uses an explicit FAK limit (not ``create_market_order``) so the crossing price is
+        deterministic. Override cents with ``BOT_MARKET_BUY_SLIPPAGE_USD`` (e.g. ``0.03``).
+        """
         with self._taker_order_lock:
             return self._place_market_buy_usdc_with_result_impl(
                 token,
@@ -637,62 +649,44 @@ class PolymarketTrader:
         confirm_get_order: bool = True,
         fee_rate_bps: int | None = None,
     ) -> Any:
-        from clob_fak import fak_buy_with_confirm
+        from clob_fak import FakBuyResult
 
         u = float(usdc)
         if u <= 0:
             raise ValueError("usdc must be > 0")
-        max_attempts = _BUY_RETRY_ATTEMPTS
-        last_exc: Exception | None = None
-        refreshed_creds = False
-        raw: dict[str, Any] | None = None
-        limit_px = 0.0
-        for attempt in range(1, max_attempts + 1):
-            opts = self._market_order_options_for_token(token)
-            margs = MarketOrderArgs(
-                token_id=token.token_id,
-                amount=u,
-                side=self._buy_side,
-                price=0.0,
-                order_type=OrderType.FAK,
-            )
-            if fee_rate_bps is not None and hasattr(margs, "fee_rate_bps"):
-                margs.fee_rate_bps = fee_rate_bps
-            limit_px = float(margs.price)
-            try:
-                raw = self._create_and_post_market_order(margs, options=opts)
-                break
-            except Exception as exc:
-                last_exc = exc
-                if _is_order_version_mismatch_error(exc) and not refreshed_creds:
-                    try:
-                        self._refresh_api_creds()
-                        refreshed_creds = True
-                    except Exception as cred_exc:
-                        LOGGER.warning("API cred refresh failed after order_version_mismatch: %s", cred_exc)
-                if attempt < max_attempts:
-                    self._sleep_before_buy_retry(
-                        attempt=attempt,
-                        token=token,
-                        amount_hint=u,
-                        reason=exc,
-                        context="market_buy_usdc_with_result",
-                    )
-                    continue
-                raise
-        if raw is None:
-            if last_exc is not None:
-                raise last_exc
-            raise RuntimeError("market buy with result failed without response")
-        est_max_sh = u / 0.01 + 10.0
-        return fak_buy_with_confirm(
-            self.client.get_order,
-            raw,
-            requested_shares=est_max_sh,
-            limit_price=limit_px,
-            confirm=confirm_get_order,
+        slip_raw = os.getenv("BOT_MARKET_BUY_SLIPPAGE_USD")
+        try:
+            slip = float(slip_raw) if slip_raw not in (None, "") else _DEFAULT_MARKET_BUY_SLIPPAGE_USD
+        except (TypeError, ValueError):
+            slip = _DEFAULT_MARKET_BUY_SLIPPAGE_USD
+        if slip < 0:
+            slip = 0.0
+        ask = self.get_best_ask(token.token_id)
+        if ask is None or ask <= 0.0:
+            raise RuntimeError("market_buy_usdc: no_best_ask_empty_book")
+        ask_f = float(ask)
+        ask_r = round(ask_f, 2)
+        target = round(ask_f + float(slip), 2)
+        # At least the visible ask (2dp), plus slippage when room below 0.99.
+        limit_px = min(_CLOB_BUY_MAX_PX, max(ask_r, target))
+        if limit_px <= 0.0:
+            raise RuntimeError("market_buy_usdc: computed_limit_non_positive")
+        # Size chosen so nominal cap at limit_px does not exceed budget (FAK fill economics still capped in clob_fak).
+        size_hint = u / limit_px
+        sz = _clob_taker_size_shares(size_hint)
+        if sz <= 0.0:
+            raise RuntimeError("market_buy_usdc: share_size_zero_after_rounding")
+        res = self._place_marketable_buy_with_result_impl(
+            token,
+            limit_px,
+            sz,
+            confirm_get_order=confirm_get_order,
+            fee_rate_bps=fee_rate_bps,
             requested_usdc=u,
         )
+        if isinstance(res, FakBuyResult) and not res.matched_any:
+            raise RuntimeError(res.error or "market_buy_usdc_no_fill")
+        return res
 
     def place_limit_sell(
         self, token: TokenMarket, price: float, size: int

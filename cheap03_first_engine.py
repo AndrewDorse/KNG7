@@ -2,18 +2,20 @@
 """
 Live / dry-run: BTC 15m UP/DOWN **cheap03** entry.
 
-**Entry** (``BOT_CHEAP03_ENTRY``, default ``dual_limits``):
-  ``dual_limits`` — on each new window, place **GTC limit buys** at ``BOT_CHEAP03_LIMIT_PX``
-  (default 0.03) for ``BOT_CHEAP03_LIMIT_SHARES`` (default 34) on **both** UP and DOWN (resting bids).
-  ``market`` — legacy: no entry limits; **one** $1 USDC FAK when midpoint first touches ≤3¢
-  (``_cheap_side_at``), same as early KNG7.
+**Entry** (``BOT_CHEAP03_ENTRY``, default ``btc50_1c`` — pool sweep winner):
 
-Stdout: **only** ``INIT`` line at start and ``WIN`` lines when a placed trade resolves winning
-(market mode only today). Other activity uses the library logger.
+- ``btc50_1c`` — **$1** FAK on **first** midpoint touch where a leg is **≤** ``BOT_CHEAP03_PRICE_MAX``
+  (default **1¢**), **only if** ``abs(Binance BTCUSDT - anchor) < BOT_BTC_MAX_MOVE_USD`` (default **50**).
+  Anchor = first successful spot read after the window slug is active. If the **first** cheap touch
+  fails the BTC gate, **no buy** for that window (matches backtest semantics).
+- ``dual_limits`` — GTC buys on UP+DOWN at ``BOT_CHEAP03_LIMIT_PX`` × ``BOT_CHEAP03_LIMIT_SHARES``.
+- ``market`` — legacy FAK when mid touches ≤ ``BOT_CHEAP03_PRICE_MAX`` (default 3¢), no BTC gate.
 
-Resting take-profit: every ``BOT_TP_POLL_SECONDS`` (default 15), GTC limit sells at **99¢**
-for each side with whole-share inventory (free balance + shares already listed at 99¢).
-Market-entry mode also forces one TP sync right after a FAK fill.
+**Take-profit:** GTC sells at ``BOT_TP_LIMIT_PX`` (default **70¢** for ``btc50_1c``, **99¢** for
+``dual_limits`` / ``market`` unless overridden). Poll ``BOT_TP_POLL_SECONDS``; ``btc50_1c`` forces
+TP sync each poll after entry is armed like dual mode.
+
+Stdout: ``INIT`` / ``WIN`` (market). Library logger for entries and TP.
 """
 
 from __future__ import annotations
@@ -104,28 +106,43 @@ class Cheap03FirstEngine:
         self.locator = locator
         self.trader = trader
         self.session = create_polymarket_session()
-        self.thr = float(os.getenv("BOT_CHEAP03_PRICE_MAX", "0.03"))
         self.notional = float(os.getenv("BOT_CHEAP03_NOTIONAL_USDC", "1.0"))
         self._last_slug: str | None = None
         self._fired_this_slug = False
         self._pending: _OpenTrade | None = None
         self._last_tp_sync_monotonic: float = 0.0
         self._tp_poll_seconds: float = float(os.getenv("BOT_TP_POLL_SECONDS", "15"))
-        entry_raw = (os.getenv("BOT_CHEAP03_ENTRY") or "dual_limits").strip().lower()
-        self._entry_dual_limits: bool = entry_raw not in (
-            "market",
-            "fak",
-            "first_touch",
-            "first_cheap",
+        entry_raw = (os.getenv("BOT_CHEAP03_ENTRY") or "btc50_1c").strip().lower()
+        self._entry_btc50_1c: bool = entry_raw in (
+            "btc50_1c",
+            "btc50",
+            "sweep_btc50",
+            "btc_gate_1c",
         )
+        self._entry_dual_limits: bool = entry_raw in ("dual_limits", "dual", "cheap03_dual")
+        self._btc_max_move_usd: float = float(os.getenv("BOT_BTC_MAX_MOVE_USD", "50"))
+        if self._entry_btc50_1c:
+            self.thr = float(os.getenv("BOT_CHEAP03_PRICE_MAX", "0.01"))
+            self._tp_limit_px: float = float(os.getenv("BOT_TP_LIMIT_PX", "0.70"))
+        elif self._entry_dual_limits:
+            self._tp_limit_px: float = float(os.getenv("BOT_TP_LIMIT_PX", "0.99"))
+        else:
+            self._tp_limit_px: float = float(os.getenv("BOT_TP_LIMIT_PX", "0.99"))
+            self.thr = float(os.getenv("BOT_CHEAP03_PRICE_MAX", "0.03"))
         self._limit_buy_px: float = float(os.getenv("BOT_CHEAP03_LIMIT_PX", "0.03"))
         self._limit_buy_shares: int = int(os.getenv("BOT_CHEAP03_LIMIT_SHARES", "34"))
         self._seed_up_done: bool = False
         self._seed_down_done: bool = False
+        self._btc_anchor_usd: float | None = None
 
     def _emit_init(self, contract: ActiveContract | None) -> None:
         slug = contract.slug if contract else "(no contract yet)"
-        mode = "dual_limits" if self._entry_dual_limits else "market_fak"
+        if self._entry_btc50_1c:
+            mode = f"btc50_1c|btc_move<{self._btc_max_move_usd:g}|tp={self._tp_limit_px:g}"
+        elif self._entry_dual_limits:
+            mode = "dual_limits"
+        else:
+            mode = "market_fak"
         _out(
             "INIT "
             f"strategy=first_cheap_03 slug={slug} "
@@ -159,8 +176,34 @@ class Cheap03FirstEngine:
         now = time.monotonic()
         if not force and (now - self._last_tp_sync_monotonic) < self._tp_poll_seconds:
             return
-        self.trader.sync_tp_limit_sells_99c(contract, dry_run=self.config.dry_run)
+        self.trader.sync_tp_limit_sells(
+            contract, tp=self._tp_limit_px, dry_run=self.config.dry_run
+        )
         self._last_tp_sync_monotonic = now
+
+    def _fetch_binance_btc_spot(self) -> float | None:
+        if not self.config.btc_feed_enabled:
+            return None
+        sym = self.config.btc_feed_symbol.upper()
+        try:
+            r = self.session.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": sym},
+                timeout=self.config.request_timeout_seconds,
+            )
+            r.raise_for_status()
+            return float(r.json()["price"])
+        except Exception as exc:
+            LOGGER.warning("[BTC50] Binance %s price fetch failed: %s", sym, exc)
+            return None
+
+    def _ensure_btc_anchor(self) -> None:
+        if self._btc_anchor_usd is not None:
+            return
+        px = self._fetch_binance_btc_spot()
+        if px is not None:
+            self._btc_anchor_usd = px
+            LOGGER.info("[BTC50] anchor spot=%.2f %s", px, self.config.btc_feed_symbol)
 
     def _try_seed_dual_buy_limits(self, contract: ActiveContract) -> None:
         """Resting GTC bids at ``_limit_buy_px`` on UP and DOWN (``cheap03_dual``-style)."""
@@ -236,10 +279,13 @@ class Cheap03FirstEngine:
                     self._last_tp_sync_monotonic = 0.0
                     self._seed_up_done = False
                     self._seed_down_done = False
+                    self._btc_anchor_usd = None
 
                 # Must run *before* ``_fired_this_slug`` continue — otherwise after a fill we never
-                # poll TP again (balance lag / transient place failure would leave no 99c sells).
+                # poll TP again (balance lag / transient place failure would leave no resting sells).
                 self._maybe_sync_tp_limits(contract)
+                if self._entry_btc50_1c and self._fired_this_slug:
+                    self._maybe_sync_tp_limits(contract, force=True)
 
                 if self._entry_dual_limits:
                     self._try_seed_dual_buy_limits(contract)
@@ -248,6 +294,72 @@ class Cheap03FirstEngine:
                         continue
                     # After both bids rest, re-check TP every poll (fills can land anytime).
                     self._maybe_sync_tp_limits(contract, force=True)
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                if self._entry_btc50_1c:
+                    self._ensure_btc_anchor()
+                    if self._fired_this_slug:
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    mu = self.trader.get_midpoint(contract.up.token_id)
+                    md = self.trader.get_midpoint(contract.down.token_id)
+                    if mu is None or md is None:
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    side = _cheap_side_at(float(mu), float(md), self.thr)
+                    if side is None:
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    btc_now = self._fetch_binance_btc_spot()
+                    if self._btc_anchor_usd is None:
+                        if btc_now is not None:
+                            self._btc_anchor_usd = btc_now
+                            LOGGER.info("[BTC50] anchor set at first cheap=%.2f", btc_now)
+                        else:
+                            time.sleep(self.config.poll_interval_seconds)
+                            continue
+                    if btc_now is None:
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    move = abs(btc_now - self._btc_anchor_usd)
+                    if move >= self._btc_max_move_usd - 1e-9:
+                        LOGGER.info(
+                            "[BTC50] %s | skip first cheap | |move|=%.2f >= %.0f anchor=%.2f now=%.2f",
+                            cur_slug,
+                            move,
+                            self._btc_max_move_usd,
+                            self._btc_anchor_usd,
+                            btc_now,
+                        )
+                        self._fired_this_slug = True
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+
+                    token = contract.up if side == "up" else contract.down
+                    entry = float(mu) if side == "up" else float(md)
+                    if self.config.dry_run:
+                        self._fired_this_slug = True
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    try:
+                        self.trader.place_market_buy_usdc_with_result(
+                            token,
+                            float(self.notional),
+                            confirm_get_order=self.config.polymarket_fak_confirm_get_order,
+                        )
+                    except Exception:
+                        time.sleep(max(2.0, self.config.poll_interval_seconds))
+                        continue
+                    self._fired_this_slug = True
+                    self._pending = _OpenTrade(
+                        slug=cur_slug,
+                        side=side,
+                        token_id=token.token_id,
+                        notional_usdc=float(self.notional),
+                    )
+                    self._maybe_sync_tp_limits(contract, force=True)
+                    _ = entry
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 

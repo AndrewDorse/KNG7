@@ -810,30 +810,35 @@ class PolymarketTrader:
             LOGGER.info("Cancelled %d/%d open orders", cancelled, len(open_orders))
         return cancelled
 
-    def sync_tp_limit_sells_99c(self, contract: ActiveContract, *, dry_run: bool) -> None:
-        """Resting take-profit: one GTC limit sell at $0.99 per outcome token for whole-share inventory.
+    def sync_tp_limit_sells(self, contract: ActiveContract, *, tp: float, dry_run: bool) -> None:
+        """Resting take-profit: GTC limit sells at ``tp`` per outcome token for whole-share inventory.
 
-        Poll from the engine (~15s). If both UP and DOWN have inventory, places (or refreshes) two sells.
+        If both UP and DOWN have inventory, places (or refreshes) two sells.
         Open sell size plus free conditional balance is used so shares escrowed in an existing TP still count.
         """
+        tp = round(float(tp), 2)
         try:
             open_orders = self.get_open_orders()
         except Exception as exc:
-            LOGGER.warning("[TP99] %s | get_open_orders failed: %s", contract.slug, exc)
+            LOGGER.warning("[TP] %s | get_open_orders failed: %s", contract.slug, exc)
             open_orders = []
         for token in (contract.up, contract.down):
-            self._sync_tp99_for_token(contract.slug, token, open_orders, dry_run=dry_run)
+            self._sync_tp_limit_for_token(contract.slug, token, open_orders, tp=tp, dry_run=dry_run)
 
-    def _sync_tp99_for_token(
+    def sync_tp_limit_sells_99c(self, contract: ActiveContract, *, dry_run: bool) -> None:
+        """Backward-compatible alias: TP at $0.99."""
+        self.sync_tp_limit_sells(contract, tp=0.99, dry_run=dry_run)
+
+    def _sync_tp_limit_for_token(
         self,
         slug: str,
         token: TokenMarket,
         open_orders: list[dict[str, Any]],
         *,
+        tp: float,
         dry_run: bool,
     ) -> None:
         tid = token.token_id
-        tp = 0.99
         match_tol = 0.005
         size_tol = 0.05
 
@@ -848,7 +853,7 @@ class PolymarketTrader:
         try:
             free = self.token_balance_allowance_refreshed(tid)
         except Exception as exc:
-            LOGGER.warning("[TP99] %s | %s balance read failed: %s", slug, token.outcome, exc)
+            LOGGER.warning("[TP] %s | %s balance read failed: %s", slug, token.outcome, exc)
             return
 
         total = free + reserved
@@ -858,7 +863,7 @@ class PolymarketTrader:
             if not tp_orders:
                 return
             if dry_run:
-                LOGGER.debug("[TP99 dry_run] %s | %s | would cancel stale TP (no inventory)", slug, token.outcome)
+                LOGGER.debug("[TP dry_run] %s | %s | would cancel stale TP (no inventory)", slug, token.outcome)
                 return
             for o in tp_orders:
                 oid = str(o.get("id") or o.get("orderID") or "")
@@ -871,7 +876,7 @@ class PolymarketTrader:
 
         if dry_run:
             LOGGER.debug(
-                "[TP99 dry_run] %s | %s | would refresh $%.2f sell x %d (free=%.4f reserved=%.4f)",
+                "[TP dry_run] %s | %s | would refresh $%.2f sell x %d (free=%.4f reserved=%.4f)",
                 slug,
                 token.outcome,
                 tp,
@@ -897,7 +902,7 @@ class PolymarketTrader:
             resp = self.place_limit_sell(token, tp, want2)
             oid = str(resp.get("orderID") or resp.get("id") or "")
             LOGGER.info(
-                "[TP99] %s | %s | placed $%.2f GTC sell x %d order=%s",
+                "[TP] %s | %s | placed $%.2f GTC sell x %d order=%s",
                 slug,
                 token.outcome,
                 tp,
@@ -906,7 +911,7 @@ class PolymarketTrader:
             )
         except Exception as exc:
             LOGGER.warning(
-                "[TP99] %s | %s | place $%.2f x %d failed: %s",
+                "[TP] %s | %s | place $%.2f x %d failed: %s",
                 slug,
                 token.outcome,
                 tp,

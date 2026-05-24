@@ -18,7 +18,9 @@ Every **`BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC`** (default **300** = 5 minutes):
 4. Queue windows not yet in `exports/limit_pair_state.json`.
 5. Place **one window pair** (UP + DOWN), then wait **`BOT_LIMIT_PAIR_ORDER_SPACING_SEC`** (default **10**) before the next — no burst posting.
 
-When both limits are visible on the CLOB, the slug is marked **confirmed**, dropped from the in-memory cache, and persisted so restarts do not duplicate.
+When both limits are visible on the CLOB, the slug is marked **done**, removed from the work queue, and persisted so restarts do not duplicate.
+
+**Work queue:** closest window start is always first. Every 5 minutes new epochs are **appended** and the list is re-sorted. Each **10s** cycle tries only the **top** slot. If placement fails (especially **insufficient balance**), that slot stays at the front and is retried after 10s — funds may free up as other orders cancel or windows settle.
 
 ## Logs (stdout)
 

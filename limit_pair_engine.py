@@ -2,15 +2,11 @@
 """
 Schedule GTC limit buys on upcoming multi-asset 5m UP/DOWN windows.
 
-Every ``search_interval`` seconds:
-  1. Compute the next ``window_count`` five-minute epochs (default 24 = 2h)
-     starting ``lead_minutes`` after now (UTC 5m aligned).
-  2. For each symbol (BTC, ETH, SOL, BNB, XRP, …) resolve Gamma slugs and cache.
-  3. Queue windows not yet marked sent.
-
-Drain the queue at ``order_spacing`` seconds per window pair (UP + DOWN).
-
-Drop cached contracts once both resting orders are confirmed on the CLOB.
+Work list (closest window start first):
+  - Every ``search_interval``: refresh target epochs, append new slots, re-sort.
+  - Drop a slot once **both** UP and DOWN limits are on the CLOB.
+  - Each ``order_spacing`` cycle: try the **top** slot only; on balance/placement
+    error, keep it at the front and retry after ``order_spacing`` (funds may free up).
 """
 
 from __future__ import annotations
@@ -20,6 +16,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +27,12 @@ from trader import PolymarketTrader
 _WINDOW_MINUTES = 5
 _WINDOW_SEC = _WINDOW_MINUTES * 60
 _WINDOWS_PER_HOUR = 60 // _WINDOW_MINUTES  # 12
+
+
+class _PlaceStatus(Enum):
+    COMPLETE = "complete"
+    RETRY = "retry"
+    NOOP = "noop"
 
 
 def _out(msg: str) -> None:
@@ -61,7 +64,6 @@ def plan_window_starts(
     window_count: int,
     window_sec: int = _WINDOW_SEC,
 ) -> list[int]:
-    """UTC 5m epochs for the scheduled block after lead time."""
     anchor = int(now_ts) + int(lead_minutes) * 60
     first = _ceil_to_window(anchor, window_sec)
     n = max(0, int(window_count))
@@ -69,7 +71,6 @@ def plan_window_starts(
 
 
 def _window_count_from_env() -> int:
-    """``BOT_LIMIT_PAIR_WINDOW_COUNT`` or ``BOT_LIMIT_PAIR_HOURS`` × 12 (5m windows/hour)."""
     raw_hours = os.getenv("BOT_LIMIT_PAIR_HOURS")
     if raw_hours not in (None, ""):
         try:
@@ -79,6 +80,22 @@ def _window_count_from_env() -> int:
         except ValueError:
             pass
     return max(1, int(os.getenv("BOT_LIMIT_PAIR_WINDOW_COUNT", "24")))
+
+
+def _is_balance_or_funds_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "insufficient",
+        "not enough",
+        "insufficient balance",
+        "insufficient funds",
+        "exceeds balance",
+        "exceeds available",
+        "balance too low",
+        "not enough balance",
+        "allowance",
+    )
+    return any(n in msg for n in needles)
 
 
 @dataclass(slots=True)
@@ -100,6 +117,7 @@ class LimitPairEngine:
         self.trader = trader
 
         self._symbols = _parse_symbols(os.getenv("BOT_LIMIT_PAIR_SYMBOLS"))
+        self._sym_rank = {s: i for i, s in enumerate(self._symbols)}
         self._lead_minutes = max(0, int(os.getenv("BOT_LIMIT_PAIR_LEAD_MINUTES", "15")))
         self._window_count = _window_count_from_env()
         self._search_interval = max(
@@ -115,10 +133,9 @@ class LimitPairEngine:
 
         state_path = os.getenv("BOT_LIMIT_PAIR_STATE_PATH", "exports/limit_pair_state.json")
         self._state_path = Path(state_path)
-        self._sent_slugs: set[str] = set()
-        self._confirmed_slugs: set[str] = set()
+        self._done_slugs: set[str] = set()
         self._contract_cache: dict[str, ActiveContract] = {}
-        self._pending_jobs: list[_WindowJob] = []
+        self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
         self._load_state()
 
@@ -132,20 +149,28 @@ class LimitPairEngine:
             return
         if not isinstance(raw, dict):
             return
-        self._sent_slugs = {str(s) for s in raw.get("sent_slugs") or []}
-        self._confirmed_slugs = {str(s) for s in raw.get("confirmed_slugs") or []}
+        done = raw.get("done_slugs") or raw.get("confirmed_slugs") or raw.get("sent_slugs")
+        self._done_slugs = {str(s) for s in (done or [])}
 
     def _save_state(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "symbols": list(self._symbols),
-            "sent_slugs": sorted(self._sent_slugs),
-            "confirmed_slugs": sorted(self._confirmed_slugs),
+            "done_slugs": sorted(self._done_slugs),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         tmp = self._state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self._state_path)
+
+    def _job_sort_key(self, job: _WindowJob) -> tuple[int, int]:
+        return (job.start_ts, self._sym_rank.get(job.symbol, 99))
+
+    def _sort_work_list(self) -> None:
+        self._work_list.sort(key=self._job_sort_key)
+
+    def _slug_in_work_list(self, slug: str) -> bool:
+        return any(j.contract.slug == slug for j in self._work_list)
 
     def _emit_init(self) -> None:
         starts = plan_window_starts(
@@ -169,61 +194,50 @@ class LimitPairEngine:
             f"lead_min={self._lead_minutes} windows={self._window_count} "
             f"slots={slots}{span} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
-            f"sent={len(self._sent_slugs)} confirmed={len(self._confirmed_slugs)} "
+            f"done={len(self._done_slugs)} queue={len(self._work_list)} "
             f"dry_run={self.config.dry_run} "
             f"funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
         )
 
-    def _prune_confirmed_cache(self) -> None:
+    def _prune_work_list(self) -> None:
+        now_ts = int(time.time())
+        kept: list[_WindowJob] = []
+        for job in self._work_list:
+            slug = job.contract.slug
+            if slug in self._done_slugs:
+                continue
+            if job.start_ts + _WINDOW_SEC <= now_ts:
+                continue
+            kept.append(job)
+        self._work_list = kept
+        self._sort_work_list()
+
+    def _prune_contract_cache(self) -> None:
         for slug in list(self._contract_cache):
-            if slug in self._confirmed_slugs:
+            if slug in self._done_slugs:
                 del self._contract_cache[slug]
 
-    def _reconcile_confirmed(self) -> None:
-        if self.config.dry_run:
-            return
-        changed = False
-        try:
-            open_orders = self.trader.get_open_orders()
-        except Exception as exc:
-            LOGGER.debug("get_open_orders for reconcile: %s", exc)
-            return
+    def _up_on_book(self, contract: ActiveContract, open_orders: list[dict] | None = None) -> bool:
+        if open_orders is not None:
+            return self._token_has_buy_near(open_orders, contract.up.token_id, self._up_px)
+        return self.trader.has_open_limit_buy_near(
+            contract.up.token_id, self._up_px, tol=self._price_tol
+        )
 
-        for slug in list(self._sent_slugs):
-            if slug in self._confirmed_slugs:
-                continue
-            contract = self._contract_cache.get(slug)
-            if contract is None:
-                continue
-            if self._both_limits_present(contract, open_orders=open_orders):
-                self._confirmed_slugs.add(slug)
-                changed = True
-                _out(f"CONFIRMED slug={slug} up={self._up_px:g} down={self._down_px:g}")
-        if changed:
-            self._prune_confirmed_cache()
-            self._save_state()
+    def _down_on_book(self, contract: ActiveContract, open_orders: list[dict] | None = None) -> bool:
+        if open_orders is not None:
+            return self._token_has_buy_near(open_orders, contract.down.token_id, self._down_px)
+        return self.trader.has_open_limit_buy_near(
+            contract.down.token_id, self._down_px, tol=self._price_tol
+        )
 
-    def _both_limits_present(
-        self,
-        contract: ActiveContract,
-        *,
-        open_orders: list[dict[str, Any]] | None = None,
+    def _pair_complete(
+        self, contract: ActiveContract, open_orders: list[dict] | None = None
     ) -> bool:
         if self.config.dry_run:
-            return True
-        if open_orders is None:
-            return (
-                self.trader.has_open_limit_buy_near(
-                    contract.up.token_id, self._up_px, tol=self._price_tol
-                )
-                and self.trader.has_open_limit_buy_near(
-                    contract.down.token_id, self._down_px, tol=self._price_tol
-                )
-            )
-        return self._token_has_buy_near(
-            open_orders, contract.up.token_id, self._up_px
-        ) and self._token_has_buy_near(
-            open_orders, contract.down.token_id, self._down_px
+            return contract.slug in self._done_slugs
+        return self._up_on_book(contract, open_orders) and self._down_on_book(
+            contract, open_orders
         )
 
     @staticmethod
@@ -256,6 +270,29 @@ class LimitPairEngine:
                 return True
         return False
 
+    def _mark_done(self, slug: str) -> None:
+        self._done_slugs.add(slug)
+        self._save_state()
+        self._prune_contract_cache()
+        self._work_list = [j for j in self._work_list if j.contract.slug != slug]
+
+    def _reconcile_done_from_clob(self) -> None:
+        """Promote work-list slots that already have both limits resting (e.g. after restart)."""
+        if self.config.dry_run or not self._work_list:
+            return
+        try:
+            open_orders = self.trader.get_open_orders()
+        except Exception as exc:
+            LOGGER.debug("get_open_orders reconcile: %s", exc)
+            return
+        for job in list(self._work_list):
+            slug = job.contract.slug
+            if slug in self._done_slugs:
+                continue
+            if self._pair_complete(job.contract, open_orders):
+                self._mark_done(slug)
+                _out(f"DONE slug={slug} up={self._up_px:g} down={self._down_px:g}")
+
     def _search_windows(self) -> None:
         now_ts = int(time.time())
         targets = plan_window_starts(
@@ -263,10 +300,8 @@ class LimitPairEngine:
             lead_minutes=self._lead_minutes,
             window_count=self._window_count,
         )
-        sym_rank = {s: i for i, s in enumerate(self._symbols)}
+        added = 0
         found = 0
-        queued = 0
-        new_jobs: list[_WindowJob] = []
 
         for start_ts in targets:
             if start_ts + _WINDOW_SEC <= now_ts:
@@ -282,52 +317,69 @@ class LimitPairEngine:
                 slug = contract.slug
                 found += 1
                 self._contract_cache[slug] = contract
-                if slug in self._sent_slugs or slug in self._confirmed_slugs:
+                if slug in self._done_slugs:
                     continue
-                if any(j.contract.slug == slug for j in self._pending_jobs):
+                if self._slug_in_work_list(slug):
                     continue
-                if any(j.contract.slug == slug for j in new_jobs):
-                    continue
-                new_jobs.append(
+                self._work_list.append(
                     _WindowJob(symbol=symbol, start_ts=start_ts, contract=contract)
                 )
-                queued += 1
+                added += 1
 
-        if new_jobs:
-            new_jobs.sort(key=lambda j: (j.start_ts, sym_rank.get(j.symbol, 99)))
-            self._pending_jobs.extend(new_jobs)
+        self._sort_work_list()
+        self._prune_work_list()
 
         target_slots = len(targets) * len(self._symbols)
-        if found or queued:
+        if found or added:
+            top = ""
+            if self._work_list:
+                j = self._work_list[0]
+                top = (
+                    f" next={j.contract.slug} "
+                    f"@{datetime.fromtimestamp(j.start_ts, tz=timezone.utc).strftime('%H:%M')}Z"
+                )
             _out(
-                f"SEARCH epochs={len(targets)} symbols={len(self._symbols)} "
-                f"slots={target_slots} resolved={found} queued={queued} "
-                f"pending={len(self._pending_jobs)}"
+                f"SEARCH epochs={len(targets)} slots={target_slots} "
+                f"resolved={found} added={added} queue={len(self._work_list)}{top}"
             )
         self.trader.sync_ws_subscriptions(list(self._contract_cache.values()))
 
-    def _place_window_pair(self, job: _WindowJob) -> None:
+    def _place_window_pair(self, job: _WindowJob) -> _PlaceStatus:
         contract = job.contract
         slug = contract.slug
-        if slug in self._sent_slugs:
-            return
+
+        if slug in self._done_slugs:
+            return _PlaceStatus.NOOP
+
         if self.config.dry_run:
-            self._sent_slugs.add(slug)
-            self._save_state()
+            self._mark_done(slug)
             _out(
                 f"ORDER dry_run slug={slug} UP ${self._up_px:g}x{self._shares} "
                 f"DOWN ${self._down_px:g}x{self._shares}"
             )
-            return
+            return _PlaceStatus.COMPLETE
 
-        placed_any = False
-        if not self.trader.has_open_limit_buy_near(
-            contract.up.token_id, self._up_px, tol=self._price_tol
-        ):
+        open_orders: list[dict] | None = None
+        try:
+            open_orders = self.trader.get_open_orders()
+        except Exception as exc:
+            LOGGER.debug("get_open_orders before place: %s", exc)
+
+        if self._pair_complete(contract, open_orders):
+            self._mark_done(slug)
+            _out(f"DONE slug={slug} (both limits already on book)")
+            return _PlaceStatus.COMPLETE
+
+        had_error = False
+        balance_blocked = False
+
+        if not self._up_on_book(contract, open_orders):
             try:
                 self.trader.place_limit_buy(contract.up, self._up_px, self._shares)
-                placed_any = True
             except Exception as exc:
+                had_error = True
+                if _is_balance_or_funds_error(exc):
+                    balance_blocked = True
                 LOGGER.error(
                     "[LIMIT_PAIR] %s UP $%.2f x %d failed: %s",
                     slug,
@@ -335,13 +387,13 @@ class LimitPairEngine:
                     self._shares,
                     exc,
                 )
-        if not self.trader.has_open_limit_buy_near(
-            contract.down.token_id, self._down_px, tol=self._price_tol
-        ):
+        if not self._down_on_book(contract, open_orders):
             try:
                 self.trader.place_limit_buy(contract.down, self._down_px, self._shares)
-                placed_any = True
             except Exception as exc:
+                had_error = True
+                if _is_balance_or_funds_error(exc):
+                    balance_blocked = True
                 LOGGER.error(
                     "[LIMIT_PAIR] %s DOWN $%.2f x %d failed: %s",
                     slug,
@@ -350,44 +402,69 @@ class LimitPairEngine:
                     exc,
                 )
 
-        if placed_any or self._both_limits_present(contract):
-            self._sent_slugs.add(slug)
-            self._save_state()
+        try:
+            open_orders = self.trader.get_open_orders()
+        except Exception:
+            open_orders = None
+
+        if self._pair_complete(contract, open_orders):
+            self._mark_done(slug)
             _out(
                 f"ORDER slug={slug} UP ${self._up_px:g}x{self._shares} "
                 f"DOWN ${self._down_px:g}x{self._shares}"
             )
+            return _PlaceStatus.COMPLETE
 
-    def _drain_queue(self) -> None:
-        while self._pending_jobs:
-            job = self._pending_jobs.pop(0)
-            self._place_window_pair(job)
-            if self._pending_jobs:
-                time.sleep(self._order_spacing)
+        if had_error:
+            up_ok = self._up_on_book(contract, open_orders)
+            down_ok = self._down_on_book(contract, open_orders)
+            why = "balance" if balance_blocked else "error"
+            _out(
+                f"RETRY_{why.upper()} slug={slug} "
+                f"up={'ok' if up_ok else 'missing'} down={'ok' if down_ok else 'missing'} "
+                f"in={self._order_spacing:g}s"
+            )
+            return _PlaceStatus.RETRY
+
+        return _PlaceStatus.NOOP
+
+    def _process_top_job(self) -> _PlaceStatus:
+        """Try the closest window at the front of the work list (one slot per cycle)."""
+        if not self._work_list:
+            return _PlaceStatus.NOOP
+        job = self._work_list[0]
+        status = self._place_window_pair(job)
+        if status == _PlaceStatus.COMPLETE:
+            # _mark_done already removed slug from work_list
+            pass
+        # RETRY: keep job at index 0 — do not pop
+        return status
 
     def run(self) -> None:
         self._emit_init()
-        self._prune_confirmed_cache()
+        self._prune_contract_cache()
+        self._search_windows()
+        self._last_search_monotonic = time.monotonic()
 
         while True:
             try:
                 now_mono = time.monotonic()
-                if (
-                    self._last_search_monotonic <= 0
-                    or (now_mono - self._last_search_monotonic) >= self._search_interval
-                ):
+                if (now_mono - self._last_search_monotonic) >= self._search_interval:
                     self._search_windows()
                     self._last_search_monotonic = now_mono
 
-                self._reconcile_confirmed()
-                self._drain_queue()
+                self._reconcile_done_from_clob()
+
+                if self._work_list:
+                    status = self._process_top_job()
+                    if status in (_PlaceStatus.COMPLETE, _PlaceStatus.RETRY):
+                        time.sleep(self._order_spacing)
+                        continue
 
                 sleep_for = min(
                     self._search_interval,
                     max(1.0, self.config.poll_interval_seconds),
                 )
-                if self._pending_jobs:
-                    sleep_for = min(sleep_for, self._order_spacing)
                 time.sleep(sleep_for)
             except KeyboardInterrupt:
                 raise

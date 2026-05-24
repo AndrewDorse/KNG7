@@ -12,7 +12,6 @@ Work list (closest window start first):
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,18 +38,6 @@ def _out(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _parse_symbols(raw: str | None) -> tuple[str, ...]:
-    s = (raw or "BTC,ETH").strip()
-    out: list[str] = []
-    seen: set[str] = set()
-    for part in s.replace(";", ",").split(","):
-        sym = part.strip().upper()
-        if sym and sym not in seen:
-            seen.add(sym)
-            out.append(sym)
-    return tuple(out) if out else ("BTC",)
-
-
 def _ceil_to_window(ts: int, window_sec: int) -> int:
     if ts <= 0:
         return 0
@@ -70,18 +57,6 @@ def plan_window_starts(
     return [first + i * window_sec for i in range(n)]
 
 
-def _window_count_from_env() -> int:
-    raw_hours = os.getenv("BOT_LIMIT_PAIR_HOURS")
-    if raw_hours not in (None, ""):
-        try:
-            hours = float(raw_hours)
-            if hours > 0:
-                return max(1, int(round(hours * _WINDOWS_PER_HOUR)))
-        except ValueError:
-            pass
-    return max(1, int(os.getenv("BOT_LIMIT_PAIR_WINDOW_COUNT", "24")))
-
-
 def _path_writable(path: Path) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,12 +68,11 @@ def _path_writable(path: Path) -> bool:
         return False
 
 
-def _resolve_state_path() -> Path:
+def _resolve_state_path(configured: str) -> Path:
     """Pick first writable path (Docker default: /app/data)."""
-    raw = (os.getenv("BOT_LIMIT_PAIR_STATE_PATH") or "").strip()
     candidates: list[Path] = []
-    if raw:
-        candidates.append(Path(raw))
+    if configured.strip():
+        candidates.append(Path(configured.strip()))
     candidates.extend(
         [
             Path("/app/data/limit_pair_state.json"),
@@ -150,22 +124,19 @@ class LimitPairEngine:
         self.locator = locator
         self.trader = trader
 
-        self._symbols = _parse_symbols(os.getenv("BOT_LIMIT_PAIR_SYMBOLS"))
+        lp = config
+        self._symbols = lp.limit_pair_symbols
         self._sym_rank = {s: i for i, s in enumerate(self._symbols)}
-        self._lead_minutes = max(0, int(os.getenv("BOT_LIMIT_PAIR_LEAD_MINUTES", "15")))
-        self._window_count = _window_count_from_env()
-        self._search_interval = max(
-            30.0, float(os.getenv("BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC", "300"))
-        )
-        self._order_spacing = max(
-            1.0, float(os.getenv("BOT_LIMIT_PAIR_ORDER_SPACING_SEC", "10"))
-        )
-        self._up_px = round(float(os.getenv("BOT_LIMIT_PAIR_UP_PX", "0.50")), 2)
-        self._down_px = round(float(os.getenv("BOT_LIMIT_PAIR_DOWN_PX", "0.49")), 2)
-        self._shares = max(1, int(os.getenv("BOT_LIMIT_PAIR_SHARES", "10")))
-        self._price_tol = max(0.001, float(os.getenv("BOT_LIMIT_PAIR_PRICE_TOL", "0.01")))
+        self._lead_minutes = lp.limit_pair_lead_minutes
+        self._window_count = lp.limit_pair_window_count
+        self._search_interval = lp.limit_pair_search_interval_seconds
+        self._order_spacing = lp.limit_pair_order_spacing_seconds
+        self._up_px = lp.limit_pair_up_px
+        self._down_px = lp.limit_pair_down_px
+        self._shares = lp.limit_pair_shares
+        self._price_tol = lp.limit_pair_price_tol
 
-        self._state_path = _resolve_state_path()
+        self._state_path = _resolve_state_path(lp.limit_pair_state_path)
         self._done_slugs: set[str] = set()
         # Legs we already POSTed (survives restarts) — prevents duplicate limits on retry.
         self._submitted_legs: dict[str, set[str]] = {}

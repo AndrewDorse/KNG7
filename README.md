@@ -8,6 +8,17 @@ Places **two GTC limit buys** on each upcoming **5m** Polymarket UP/DOWN window 
 
 Gamma slugs: `{sym}-updown-5m-<epoch>` (UTC window start).
 
+## Config (`.env` only — no rebuild)
+
+| Variable | Example | Meaning |
+|----------|---------|---------|
+| `BOT_LIMIT_PAIR_SYMBOLS` | `BTC,ETH` | Pairs to trade |
+| `BOT_LIMIT_PAIR_UP_PX` | `0.50` | UP limit buy price |
+| `BOT_LIMIT_PAIR_DOWN_PX` | `0.49` | DOWN limit buy price |
+| `BOT_LIMIT_PAIR_SHARES` | `10` | Shares per leg |
+
+After editing `.env`: `docker compose up -d --force-recreate` (no `build` needed unless code changed).
+
 ## Schedule
 
 Every **`BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC`** (default **300** = 5 minutes):

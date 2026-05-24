@@ -54,6 +54,23 @@ def _parse_window_minutes_tokens(raw: str | None) -> tuple[int, ...]:
     return tuple(out) if out else (15,)
 
 
+def _parse_symbol_list(raw: str | None, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse comma/semicolon asset list (``BOT_LIMIT_PAIR_SYMBOLS`` / ``BOT_LIMIT_PAIR_PAIRS``)."""
+    s = (raw or "").strip()
+    if not s:
+        return default
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in s.replace(";", ",").split(","):
+        sym = part.strip().upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    if not out:
+        raise BotConfigError("Symbol list must contain at least one ticker.")
+    return tuple(out)
+
+
 def _strip_env_copy_artifacts(value: str) -> str:
     """Remove stray prefixes from pasted env values (e.g. `.git0x...` from a broken .env line)."""
     s = value.strip().strip('"').strip("'")
@@ -320,6 +337,17 @@ class BotConfig:
     shaman_v1_notional_max_usdc: float = 500.0
     shaman_v1_min_shares: int = 1
     shaman_v1_min_notional_usdc: float = 1.0
+    # limit_pair_5m — all tunables via .env (no rebuild). See BOT_LIMIT_PAIR_* in .env.example.
+    limit_pair_symbols: tuple[str, ...] = ("BTC", "ETH")
+    limit_pair_up_px: float = 0.50
+    limit_pair_down_px: float = 0.49
+    limit_pair_shares: int = 10
+    limit_pair_lead_minutes: int = 15
+    limit_pair_window_count: int = 24
+    limit_pair_search_interval_seconds: float = 300.0
+    limit_pair_order_spacing_seconds: float = 10.0
+    limit_pair_state_path: str = "exports/limit_pair_state.json"
+    limit_pair_price_tol: float = 0.01
 
     @property
     def window_minutes(self) -> int:
@@ -379,6 +407,37 @@ class BotConfig:
 
         raw_mode = _normalize_strategy_mode(os.getenv("BOT_STRATEGY_MODE", "shaman_v1"))
         window_minutes_tokens = _parse_window_minutes_tokens(os.getenv("BOT_WINDOW_MINUTES"))
+
+        limit_pair_symbols_raw = (
+            (os.getenv("BOT_LIMIT_PAIR_SYMBOLS") or os.getenv("BOT_LIMIT_PAIR_PAIRS") or "").strip()
+        )
+        limit_pair_symbols = _parse_symbol_list(
+            limit_pair_symbols_raw or None, default=("BTC", "ETH")
+        )
+        up_env = os.getenv("BOT_LIMIT_PAIR_UP_PX") or os.getenv("BOT_LIMIT_PAIR_UP_PRICE")
+        down_env = os.getenv("BOT_LIMIT_PAIR_DOWN_PX") or os.getenv("BOT_LIMIT_PAIR_DOWN_PRICE")
+        shares_env = os.getenv("BOT_LIMIT_PAIR_SHARES") or os.getenv("BOT_LIMIT_PAIR_SIZE")
+        try:
+            limit_pair_up_px = round(float(up_env) if up_env not in (None, "") else 0.50, 2)
+            limit_pair_down_px = round(float(down_env) if down_env not in (None, "") else 0.49, 2)
+        except ValueError as exc:
+            raise BotConfigError("BOT_LIMIT_PAIR_UP_PX / DOWN_PX must be numbers") from exc
+        try:
+            limit_pair_shares = max(
+                1,
+                int(shares_env) if shares_env not in (None, "") else 10,
+            )
+        except ValueError as exc:
+            raise BotConfigError("BOT_LIMIT_PAIR_SHARES must be an int") from exc
+        limit_pair_hours_raw = os.getenv("BOT_LIMIT_PAIR_HOURS")
+        if limit_pair_hours_raw not in (None, ""):
+            try:
+                limit_pair_window_count = max(1, int(round(float(limit_pair_hours_raw) * 12)))
+            except ValueError as exc:
+                raise BotConfigError("BOT_LIMIT_PAIR_HOURS must be a number") from exc
+        else:
+            limit_pair_window_count = max(1, _env_int("BOT_LIMIT_PAIR_WINDOW_COUNT", 24))
+
         default_strategy_budget = (
             400.0
             if raw_mode == "paladin_v9"
@@ -654,6 +713,23 @@ class BotConfig:
             ),
             shaman_v1_min_shares=max(1, _env_int("BOT_SHAMAN_V1_MIN_SHARES", 1)),
             shaman_v1_min_notional_usdc=max(0.5, _env_float("BOT_SHAMAN_V1_MIN_NOTIONAL_USDC", 1.0)),
+            limit_pair_symbols=limit_pair_symbols,
+            limit_pair_up_px=limit_pair_up_px,
+            limit_pair_down_px=limit_pair_down_px,
+            limit_pair_shares=limit_pair_shares,
+            limit_pair_lead_minutes=max(0, _env_int("BOT_LIMIT_PAIR_LEAD_MINUTES", 15)),
+            limit_pair_window_count=limit_pair_window_count,
+            limit_pair_search_interval_seconds=max(
+                30.0, _env_float("BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC", 300.0)
+            ),
+            limit_pair_order_spacing_seconds=max(
+                1.0, _env_float("BOT_LIMIT_PAIR_ORDER_SPACING_SEC", 10.0)
+            ),
+            limit_pair_state_path=os.getenv(
+                "BOT_LIMIT_PAIR_STATE_PATH", "exports/limit_pair_state.json"
+            ).strip()
+            or "exports/limit_pair_state.json",
+            limit_pair_price_tol=max(0.001, _env_float("BOT_LIMIT_PAIR_PRICE_TOL", 0.01)),
         )
         if cfg.strategy_mode in ("paladin_v7", "paladin_v9") and (
             cfg.strategy_budget_cap_usdc + 1e-9 < cfg.strategy_min_budget_usdc
@@ -679,6 +755,15 @@ class BotConfig:
                 raise BotConfigError(
                     "BOT_WINDOW_MINUTES: at most two entries (5 and 15) for first_cheap_03."
                 )
+        if cfg.strategy_mode == "limit_pair_5m":
+            for px, name in (
+                (cfg.limit_pair_up_px, "BOT_LIMIT_PAIR_UP_PX"),
+                (cfg.limit_pair_down_px, "BOT_LIMIT_PAIR_DOWN_PX"),
+            ):
+                if not (0.01 <= px <= 0.99):
+                    raise BotConfigError(
+                        f"{name} must be between 0.01 and 0.99 (got {px})."
+                    )
         return cfg
 
 

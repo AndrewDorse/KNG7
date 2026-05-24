@@ -839,24 +839,94 @@ class PolymarketTrader:
         except Exception:
             return []
 
-    def has_open_limit_buy_near(
-        self, token_id: str, price: float, *, tol: float = 0.01
-    ) -> bool:
-        """True if a resting BUY exists on ``token_id`` with limit price within ``tol`` of ``price``."""
+    def resting_buy_shares_near(
+        self,
+        token_id: str,
+        price: float,
+        *,
+        tol: float = 0.01,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> float:
+        """Sum resting BUY size on ``token_id`` at limit prices within ``tol`` of ``price``."""
         try:
-            raw = self.get_open_orders()
+            raw = open_orders if open_orders is not None else self.get_open_orders()
         except Exception:
-            return False
+            return 0.0
+        total = 0.0
+        px_target = float(price)
         for o in raw:
             if _open_order_token_id(o) != token_id:
                 continue
             if _open_order_side_upper(o) != BUY:
                 continue
-            if abs(_open_order_price(o) - float(price)) > tol:
+            if abs(_open_order_price(o) - px_target) > tol:
                 continue
-            if _open_order_remaining_shares(o) > 1e-6:
-                return True
-        return False
+            total += _open_order_remaining_shares(o)
+        return total
+
+    def has_sufficient_resting_buy(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        *,
+        tol: float = 0.01,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        want = float(size)
+        if want <= 0:
+            return True
+        return self.resting_buy_shares_near(
+            token_id, price, tol=tol, open_orders=open_orders
+        ) >= want - 1e-6
+
+    def has_open_limit_buy_near(
+        self, token_id: str, price: float, *, tol: float = 0.01
+    ) -> bool:
+        """True if a resting BUY exists on ``token_id`` with limit price within ``tol`` of ``price``."""
+        return self.resting_buy_shares_near(token_id, price, tol=tol) > 1e-6
+
+    def cancel_excess_limit_buys(
+        self,
+        token_id: str,
+        price: float,
+        max_shares: float,
+        *,
+        tol: float = 0.01,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Cancel BUY orders at ``price`` until total resting size is <= ``max_shares``."""
+        try:
+            raw = open_orders if open_orders is not None else self.get_open_orders()
+        except Exception:
+            return 0
+        px_target = float(price)
+        cap = float(max_shares)
+        matches: list[tuple[str, float]] = []
+        for o in raw:
+            if _open_order_token_id(o) != token_id:
+                continue
+            if _open_order_side_upper(o) != BUY:
+                continue
+            if abs(_open_order_price(o) - px_target) > tol:
+                continue
+            rem = _open_order_remaining_shares(o)
+            if rem <= 1e-6:
+                continue
+            oid = str(o.get("id") or o.get("orderID") or "")
+            if oid:
+                matches.append((oid, rem))
+        total = sum(rem for _, rem in matches)
+        if total <= cap + 1e-6:
+            return 0
+        cancelled = 0
+        for oid, rem in sorted(matches, key=lambda x: x[1], reverse=True):
+            if total <= cap + 1e-6:
+                break
+            if self.cancel_order(oid):
+                total -= rem
+                cancelled += 1
+        return cancelled
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order by ID. Returns True on success."""

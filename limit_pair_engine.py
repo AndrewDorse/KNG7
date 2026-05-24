@@ -167,6 +167,8 @@ class LimitPairEngine:
 
         self._state_path = _resolve_state_path()
         self._done_slugs: set[str] = set()
+        # Legs we already POSTed (survives restarts) — prevents duplicate limits on retry.
+        self._submitted_legs: dict[str, set[str]] = {}
         self._contract_cache: dict[str, ActiveContract] = {}
         self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
@@ -184,11 +186,21 @@ class LimitPairEngine:
             return
         done = raw.get("done_slugs") or raw.get("confirmed_slugs") or raw.get("sent_slugs")
         self._done_slugs = {str(s) for s in (done or [])}
+        submitted = raw.get("submitted_legs") or {}
+        if isinstance(submitted, dict):
+            for slug, legs in submitted.items():
+                if isinstance(legs, list):
+                    self._submitted_legs[str(slug)] = {
+                        str(x).strip().upper() for x in legs if str(x).strip()
+                    }
 
     def _save_state(self) -> None:
         payload = {
             "symbols": list(self._symbols),
             "done_slugs": sorted(self._done_slugs),
+            "submitted_legs": {
+                slug: sorted(legs) for slug, legs in sorted(self._submitted_legs.items())
+            },
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         body = json.dumps(payload, indent=2)
@@ -272,61 +284,99 @@ class LimitPairEngine:
             if slug in self._done_slugs:
                 del self._contract_cache[slug]
 
-    def _up_on_book(self, contract: ActiveContract, open_orders: list[dict] | None = None) -> bool:
-        if open_orders is not None:
-            return self._token_has_buy_near(open_orders, contract.up.token_id, self._up_px)
-        return self.trader.has_open_limit_buy_near(
-            contract.up.token_id, self._up_px, tol=self._price_tol
+    def _fetch_open_orders(self, *, attempts: int = 3) -> list[dict[str, Any]]:
+        last: list[dict[str, Any]] = []
+        for i in range(max(1, attempts)):
+            last = self.trader.get_open_orders()
+            if last or i >= attempts - 1:
+                return last
+            time.sleep(0.4)
+        return last
+
+    def _note_submitted(self, slug: str, leg: str) -> None:
+        self._submitted_legs.setdefault(slug, set()).add(leg.strip().upper())
+        self._save_state()
+
+    def _leg_satisfied(
+        self,
+        slug: str,
+        leg: str,
+        token_id: str,
+        price: float,
+        open_orders: list[dict[str, Any]],
+    ) -> bool:
+        """True when we should NOT post another limit for this leg."""
+        leg_u = leg.strip().upper()
+        resting = self.trader.resting_buy_shares_near(
+            token_id, price, tol=self._price_tol, open_orders=open_orders
+        )
+        if resting >= float(self._shares) - 1e-6:
+            return True
+        submitted = self._submitted_legs.get(slug, set())
+        if leg_u in submitted and resting > 1e-6:
+            return True
+        if leg_u in submitted and resting <= 1e-6:
+            # POST accepted earlier; book may lag — do not stack duplicate orders.
+            return True
+        return False
+
+    def _up_satisfied(
+        self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
+    ) -> bool:
+        return self._leg_satisfied(
+            slug, "UP", contract.up.token_id, self._up_px, open_orders
         )
 
-    def _down_on_book(self, contract: ActiveContract, open_orders: list[dict] | None = None) -> bool:
-        if open_orders is not None:
-            return self._token_has_buy_near(open_orders, contract.down.token_id, self._down_px)
-        return self.trader.has_open_limit_buy_near(
-            contract.down.token_id, self._down_px, tol=self._price_tol
+    def _down_satisfied(
+        self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
+    ) -> bool:
+        return self._leg_satisfied(
+            slug, "DOWN", contract.down.token_id, self._down_px, open_orders
         )
 
     def _pair_complete(
-        self, contract: ActiveContract, open_orders: list[dict] | None = None
+        self,
+        slug: str,
+        contract: ActiveContract,
+        open_orders: list[dict[str, Any]],
     ) -> bool:
         if self.config.dry_run:
-            return contract.slug in self._done_slugs
-        return self._up_on_book(contract, open_orders) and self._down_on_book(
-            contract, open_orders
+            return slug in self._done_slugs
+        return self._up_satisfied(slug, contract, open_orders) and self._down_satisfied(
+            slug, contract, open_orders
         )
 
-    @staticmethod
-    def _token_has_buy_near(
-        orders: list[dict[str, Any]], token_id: str, price: float, *, tol: float = 0.01
-    ) -> bool:
-        for o in orders:
-            tid = str(
-                o.get("asset_id")
-                or o.get("assetId")
-                or o.get("token_id")
-                or o.get("tokenId")
-                or ""
+    def _trim_excess_for_contract(
+        self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
+    ) -> None:
+        if self.config.dry_run:
+            return
+        for leg, token, px in (
+            ("UP", contract.up, self._up_px),
+            ("DOWN", contract.down, self._down_px),
+        ):
+            resting = self.trader.resting_buy_shares_near(
+                token.token_id, px, tol=self._price_tol, open_orders=open_orders
             )
-            if tid != token_id:
+            if resting <= float(self._shares) + 1e-6:
                 continue
-            if str(o.get("side") or "").upper() != "BUY":
-                continue
-            try:
-                px = float(o.get("price") or 0)
-            except (TypeError, ValueError):
-                continue
-            if abs(px - float(price)) > tol:
-                continue
-            try:
-                sz = float(o.get("size") or o.get("original_size") or 0)
-            except (TypeError, ValueError):
-                sz = 0.0
-            if sz > 1e-6:
-                return True
-        return False
+            n = self.trader.cancel_excess_limit_buys(
+                token.token_id,
+                px,
+                float(self._shares),
+                tol=self._price_tol,
+                open_orders=open_orders,
+            )
+            if n:
+                _out(
+                    f"TRIM slug={slug} {leg} resting={resting:g} -> cap {self._shares} "
+                    f"cancelled={n}"
+                )
+                open_orders[:] = self._fetch_open_orders()
 
     def _mark_done(self, slug: str) -> None:
         self._done_slugs.add(slug)
+        self._submitted_legs.pop(slug, None)
         self._save_state()
         self._prune_contract_cache()
         self._work_list = [j for j in self._work_list if j.contract.slug != slug]
@@ -344,7 +394,7 @@ class LimitPairEngine:
             slug = job.contract.slug
             if slug in self._done_slugs:
                 continue
-            if self._pair_complete(job.contract, open_orders):
+            if self._pair_complete(slug, job.contract, open_orders):
                 self._mark_done(slug)
                 _out(f"DONE slug={slug} up={self._up_px:g} down={self._down_px:g}")
 
@@ -414,13 +464,10 @@ class LimitPairEngine:
             )
             return _PlaceStatus.COMPLETE
 
-        open_orders: list[dict] | None = None
-        try:
-            open_orders = self.trader.get_open_orders()
-        except Exception as exc:
-            LOGGER.debug("get_open_orders before place: %s", exc)
+        open_orders = self._fetch_open_orders()
+        self._trim_excess_for_contract(slug, contract, open_orders)
 
-        if self._pair_complete(contract, open_orders):
+        if self._pair_complete(slug, contract, open_orders):
             self._mark_done(slug)
             _out(f"DONE slug={slug} (both limits already on book)")
             return _PlaceStatus.COMPLETE
@@ -428,9 +475,10 @@ class LimitPairEngine:
         had_error = False
         balance_blocked = False
 
-        if not self._up_on_book(contract, open_orders):
+        if not self._up_satisfied(slug, contract, open_orders):
             try:
                 self.trader.place_limit_buy(contract.up, self._up_px, self._shares)
+                self._note_submitted(slug, "UP")
             except Exception as exc:
                 had_error = True
                 if _is_balance_or_funds_error(exc):
@@ -442,9 +490,10 @@ class LimitPairEngine:
                     self._shares,
                     exc,
                 )
-        if not self._down_on_book(contract, open_orders):
+        if not self._down_satisfied(slug, contract, open_orders):
             try:
                 self.trader.place_limit_buy(contract.down, self._down_px, self._shares)
+                self._note_submitted(slug, "DOWN")
             except Exception as exc:
                 had_error = True
                 if _is_balance_or_funds_error(exc):
@@ -457,12 +506,10 @@ class LimitPairEngine:
                     exc,
                 )
 
-        try:
-            open_orders = self.trader.get_open_orders()
-        except Exception:
-            open_orders = None
+        open_orders = self._fetch_open_orders()
+        self._trim_excess_for_contract(slug, contract, open_orders)
 
-        if self._pair_complete(contract, open_orders):
+        if self._pair_complete(slug, contract, open_orders):
             self._mark_done(slug)
             _out(
                 f"ORDER slug={slug} UP ${self._up_px:g}x{self._shares} "
@@ -471,17 +518,29 @@ class LimitPairEngine:
             return _PlaceStatus.COMPLETE
 
         if had_error:
-            up_ok = self._up_on_book(contract, open_orders)
-            down_ok = self._down_on_book(contract, open_orders)
+            up_rest = self.trader.resting_buy_shares_near(
+                contract.up.token_id, self._up_px, tol=self._price_tol, open_orders=open_orders
+            )
+            down_rest = self.trader.resting_buy_shares_near(
+                contract.down.token_id,
+                self._down_px,
+                tol=self._price_tol,
+                open_orders=open_orders,
+            )
             why = "balance" if balance_blocked else "error"
             _out(
                 f"RETRY_{why.upper()} slug={slug} "
-                f"up={'ok' if up_ok else 'missing'} down={'ok' if down_ok else 'missing'} "
+                f"up={up_rest:g}/{self._shares} down={down_rest:g}/{self._shares} "
                 f"in={self._order_spacing:g}s"
             )
             return _PlaceStatus.RETRY
 
-        return _PlaceStatus.NOOP
+        # Book still catching up after successful POST — wait, do not stack orders.
+        _out(
+            f"WAIT_BOOK slug={slug} in={self._order_spacing:g}s "
+            f"(submitted, confirming on CLOB)"
+        )
+        return _PlaceStatus.RETRY
 
     def _process_top_job(self) -> _PlaceStatus:
         """Try the closest window at the front of the work list (one slot per cycle)."""

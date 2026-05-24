@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KNG7 Docker: **first_cheap_03** — BTC 5m and/or 15m in one process (BOT_WINDOW_MINUTES); btc50_1c or dual/market."""
+"""KNG7 Docker: **limit_pair_5m** — schedule UP/DOWN GTC limits on upcoming BTC 5m windows."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def main() -> int:
     from market_locator import GammaMarketLocator  # noqa: PLC0415
     from trader import PolymarketTrader  # noqa: PLC0415
 
-    from cheap03_first_engine import Cheap03FirstEngine  # noqa: PLC0415
+    from limit_pair_engine import LimitPairEngine  # noqa: PLC0415
 
     try:
         config = BotConfig.from_env()
@@ -47,9 +47,9 @@ def main() -> int:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
 
-    if config.strategy_mode != "first_cheap_03":
+    if config.strategy_mode != "limit_pair_5m":
         print(
-            "KNG7 image expects BOT_STRATEGY_MODE=first_cheap_03 "
+            "KNG7 image expects BOT_STRATEGY_MODE=limit_pair_5m "
             f"(got {config.strategy_mode!r}).",
             file=sys.stderr,
         )
@@ -62,7 +62,7 @@ def main() -> int:
 
     locator = GammaMarketLocator(config)
     trader = PolymarketTrader(config)
-    Cheap03FirstEngine(config, locator, trader).run()
+    LimitPairEngine(config, locator, trader).run()
     return 0
 
 

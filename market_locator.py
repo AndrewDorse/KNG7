@@ -47,6 +47,8 @@ class GammaMarketLocator:
         self.session = create_polymarket_session()
         # SHAMAN (and similar): separate Gamma slugs per window length, e.g. btc-updown-5m-* vs btc-updown-15m-*
         self._contract_by_window_min: dict[int, tuple[ActiveContract | None, float]] = {}
+        # Explicit epoch lookups (scheduled future windows).
+        self._contract_by_start: dict[tuple[int, int], tuple[ActiveContract | None, float]] = {}
 
     def get_active_contract(self) -> ActiveContract | None:
         """Legacy single-window API: first entry in ``BOT_WINDOW_MINUTES`` (comma list)."""
@@ -57,29 +59,46 @@ class GammaMarketLocator:
         """Resolve UP/DOWN market for a specific candle window (5 vs 15), independent of ``BOT_WINDOW_MINUTES``."""
         if window_minutes <= 0:
             return self.get_active_contract()
-        now = time.time()
-        now_dt = datetime.now(timezone.utc)
+        now_ts = int(time.time())
         window_size = int(window_minutes) * 60
-        tup = self._contract_by_window_min.get(int(window_minutes))
-        if tup is not None:
-            contract, cache_expires_at = tup
-            if contract is not None and contract.end_time > now_dt:
-                cached_start = contract.end_time.timestamp() - window_size
-                if now >= cached_start or now < cache_expires_at:
-                    return contract
-        contract = self._discover_for_window_minutes(int(window_minutes))
-        self._contract_by_window_min[int(window_minutes)] = (contract, now + 30.0)
+        target_start = (now_ts // window_size) * window_size
+        return self.get_contract_for_window_start(int(window_minutes), target_start)
+
+    def get_contract_for_window_start(
+        self, window_minutes: int, window_start_ts: int
+    ) -> ActiveContract | None:
+        """Fetch UP/DOWN market for an explicit window epoch (``btc-updown-5m-<epoch>`` slug)."""
+        wm = int(window_minutes)
+        start = int(window_start_ts)
+        cache_key = (wm, start)
+        now = time.time()
+        cached = self._contract_by_start.get(cache_key)
+        if cached is not None:
+            contract, cache_expires_at = cached
+            if contract is not None and contract.end_time.timestamp() > now:
+                return contract
+            if contract is None and now < cache_expires_at:
+                return None
+        contract = self._discover_for_window_start(wm, start)
+        # Miss: short negative cache; hit: longer positive cache.
+        ttl = 120.0 if contract is not None else 45.0
+        self._contract_by_start[cache_key] = (contract, now + ttl)
         return contract
 
     @_retry(max_attempts=5, backoff_base=0.75)
     def _discover_for_window_minutes(self, window_minutes: int) -> ActiveContract | None:
-        now = datetime.now(timezone.utc)
-        now_ts = int(now.timestamp())
+        now_ts = int(datetime.now(timezone.utc).timestamp())
         window_size = window_minutes * 60
-        current_start = (now_ts // window_size) * window_size
-        target_start = current_start
+        target_start = (now_ts // window_size) * window_size
+        return self._discover_for_window_start(int(window_minutes), target_start)
+
+    @_retry(max_attempts=5, backoff_base=0.75)
+    def _discover_for_window_start(
+        self, window_minutes: int, target_start: int
+    ) -> ActiveContract | None:
+        now = datetime.now(timezone.utc)
         sym = self.config.market_symbol.lower()
-        slug = f"{sym}-updown-{window_minutes}m-{target_start}"
+        slug = f"{sym}-updown-{window_minutes}m-{int(target_start)}"
         resp = self.session.get(
             f"{GAMMA_URL}/markets",
             params={"slug": slug},

@@ -104,6 +104,8 @@ def _normalize_strategy_mode(raw: str | None) -> str:
         return "shaman_v1"
     if s in ("first_cheap_03", "cheap03", "3c_first", "first_cheap3"):
         return "first_cheap_03"
+    if s in ("limit_pair_5m", "limit_pair", "dual_limit_5m", "btc5m_limit_pair"):
+        return "limit_pair_5m"
     if s in ("iy2", "iy_2", "wallet_overlap", "wallet_overlap_live", "iy2_live"):
         return "iy2"
     if s in ("iy3", "iy_3", "wallet_overlap_path", "wallet_overlap_path_live", "iy3_live"):

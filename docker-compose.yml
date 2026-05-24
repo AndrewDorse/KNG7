@@ -1,5 +1,4 @@
-# KNG7: first_cheap_03 — one process can trade BTC 5m and 15m together via BOT_WINDOW_MINUTES=5,15
-# (same btc50_1c rules per lane). Copy .env.example -> .env
+# KNG7: limit_pair_5m — scheduled dual limits on upcoming BTC 5m windows. Copy .env.example -> .env
 services:
   bot:
     build: .

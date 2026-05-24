@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-05-02-first-cheap-03
-LABEL org.opencontainers.image.title="KNG7 first_cheap_03" \
-      org.opencontainers.image.description="Docker: BTC 5m/15m/both (comma BOT_WINDOW_MINUTES) btc50_1c or dual/market" \
+ARG KNG7_IMAGE_TAG=2026-05-24-limit-pair-5m
+LABEL org.opencontainers.image.title="KNG7 limit_pair_5m" \
+      org.opencontainers.image.description="Docker: scheduled BTC 5m UP/DOWN GTC limits (50c/49c)" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -19,7 +19,7 @@ RUN pip install --upgrade pip && \
     pip install -r /app/requirements.txt
 
 COPY main.py /app/main.py
-COPY cheap03_first_engine.py /app/cheap03_first_engine.py
+COPY limit_pair_engine.py /app/limit_pair_engine.py
 COPY config.py /app/config.py
 COPY trader.py /app/trader.py
 COPY market_locator.py /app/market_locator.py

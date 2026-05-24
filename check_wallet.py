@@ -19,11 +19,6 @@ def main() -> int:
     print("=" * 60)
     print("KNG7 wallet / CLOB check")
     print("=" * 60)
-    print(f"POLY_FUNDER:          {config.funder}")
-    print(f"POLY_SIGNATURE_TYPE:  {config.signature_type}")
-    print(f"RELAYER_API_KEY set:  {'yes' if config.relayer_api_key else 'no'}")
-    print(f"POLY_DRY_RUN:         {config.dry_run}")
-    print()
 
     try:
         trader = PolymarketTrader(config)
@@ -31,6 +26,15 @@ def main() -> int:
         print(f"FAIL: could not init CLOB client: {exc}")
         print(wallet_config_hint_for_error(exc))
         return 1
+
+    summary = trader.wallet_setup_summary()
+    print(f"Signer EOA (private key): {summary.get('eoa')}")
+    print(f"POLY_FUNDER (maker):      {summary.get('funder')}")
+    print(f"POLY_SIGNATURE_TYPE:      {summary.get('signature_type')}")
+    print(f"CLOB v2 client:           {summary.get('clob_v2')}")
+    print(f"RELAYER_API_KEY set:      {summary.get('relayer_api_key')}")
+    print(f"Balance (CLOB):           ${summary.get('balance_usdc', 0):.2f}")
+    print()
 
     ok, detail = trader.verify_clob_ready()
     if ok:

@@ -756,6 +756,11 @@ class BotConfig:
                     "BOT_WINDOW_MINUTES: at most two entries (5 and 15) for first_cheap_03."
                 )
         if cfg.strategy_mode == "limit_pair_5m":
+            if cfg.signature_type not in (0, 1, 2, 3):
+                raise BotConfigError(
+                    "POLY_SIGNATURE_TYPE must be 0–3 "
+                    f"(got {cfg.signature_type})."
+                )
             for px, name in (
                 (cfg.limit_pair_up_px, "BOT_LIMIT_PAIR_UP_PX"),
                 (cfg.limit_pair_down_px, "BOT_LIMIT_PAIR_DOWN_PX"),

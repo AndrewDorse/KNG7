@@ -61,14 +61,20 @@ def main() -> int:
         )
 
     locator = GammaMarketLocator(config)
-    trader = PolymarketTrader(config)
+    try:
+        trader = PolymarketTrader(config)
+    except Exception as exc:
+        print(f"WALLET_FAIL init: {exc}", file=sys.stderr)
+        print(wallet_config_hint_for_error(exc), file=sys.stderr)
+        return 2
+
     if not config.dry_run:
         ok, detail = trader.verify_clob_ready()
-        if ok:
-            print(f"WALLET_OK {detail}", flush=True)
-        else:
-            print(f"WALLET_WARN {detail}", flush=True)
-            print(wallet_config_hint_for_error(Exception(detail)), flush=True)
+        print(f"WALLET_CHECK {'OK' if ok else 'FAIL'} {detail}", flush=True)
+        if not ok:
+            print(wallet_config_hint_for_error(Exception(detail)), file=sys.stderr)
+            return 2
+
     LimitPairEngine(config, locator, trader).run()
     return 0
 

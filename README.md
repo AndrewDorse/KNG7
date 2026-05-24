@@ -42,6 +42,28 @@ When both limits are visible on the CLOB, the slug is marked **done**, removed f
 
 Stderr: **`BOT_LOG_LEVEL`** (default **ERROR** in `main.py`).
 
+## Wallet / “deposit wallet flow” errors
+
+If orders fail with **`maker address not allowed`** or **`Could not derive api key`**:
+
+| How you log in to Polymarket | `POLY_SIGNATURE_TYPE` | `POLY_FUNDER` |
+|------------------------------|----------------------|---------------|
+| Email / Magic link | `1` | Profile **deposit** address (not EOA) |
+| MetaMask / browser wallet | `2` | Profile **deposit** address (not MetaMask EOA) |
+| New deposit-wallet accounts | `3` | Deposit wallet address |
+
+- **`POLY_PRIVATE_KEY`** — key that controls the Polymarket account (exports from your wallet or Polymarket setup).
+- **`POLY_FUNDER`** — copy from **polymarket.com → Profile / Deposit** (where your USDC balance lives). It is usually **different** from your MetaMask address.
+- Optional: **`RELAYER_API_KEY`** (+ secret + passphrase) from Polymarket if auto derive fails.
+
+Verify before live trading:
+
+```bash
+docker compose run --rm bot python check_wallet.py
+```
+
+Bot exits at startup with **`WALLET_CHECK FAIL`** if config looks wrong (when `POLY_DRY_RUN=false`).
+
 ## Go-live
 
 1. `cp .env.example .env` — **`POLY_PRIVATE_KEY`**, **`POLY_FUNDER`**, **`POLY_DRY_RUN=false`** for live.  

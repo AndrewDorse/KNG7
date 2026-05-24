@@ -319,7 +319,17 @@ class PolymarketTrader:
             )
             self.client.set_api_creds(creds)
             return
-        # For mismatch recovery, force a fresh derive/create sequence from signer.
+        create_or_derive = getattr(self.client, "create_or_derive_api_key", None)
+        if callable(create_or_derive):
+            try:
+                creds = create_or_derive()
+                if creds is None:
+                    raise RuntimeError("create_or_derive_api_key returned None")
+                self.client.set_api_creds(creds)
+                return
+            except Exception as exc:
+                LOGGER.error("create_or_derive_api_key failed: %s", exc)
+                raise RuntimeError(f"CLOB API credentials failed: {exc}") from exc
         try:
             creds = self.client.derive_api_key()
             if creds is None:
@@ -337,17 +347,84 @@ class PolymarketTrader:
                 raise RuntimeError("create_api_key returned None")
         self.client.set_api_creds(creds)
 
+    def signer_eoa_address(self) -> str | None:
+        """Address derived from POLY_PRIVATE_KEY (order signer for proxy/Safe flows)."""
+        try:
+            addr = self.client.get_address()
+            return str(addr) if addr else None
+        except Exception:
+            if _CLOB_V2:
+                try:
+                    from py_clob_client_v2.signer import Signer
+
+                    return Signer(self.config.private_key, CHAIN_ID).address()
+                except Exception:
+                    return None
+            return None
+
+    def wallet_setup_summary(self) -> dict[str, Any]:
+        bal = 0.0
+        try:
+            bal = self.wallet_balance_usdc()
+        except Exception:
+            pass
+        return {
+            "eoa": self.signer_eoa_address(),
+            "funder": self.config.funder,
+            "signature_type": self.config.signature_type,
+            "balance_usdc": bal,
+            "relayer_api_key": bool(self.config.relayer_api_key),
+            "clob_v2": _CLOB_V2,
+        }
+
+    def validate_wallet_config(self) -> tuple[bool, str]:
+        """Pre-flight checks before placing maker orders."""
+        summary = self.wallet_setup_summary()
+        eoa = (summary.get("eoa") or "").strip().lower()
+        funder = (summary.get("funder") or "").strip().lower()
+        sig = int(summary.get("signature_type") or 0)
+
+        if not eoa or not funder:
+            return False, "Missing EOA (from private key) or POLY_FUNDER"
+
+        if sig in (1, 2) and eoa == funder:
+            return (
+                False,
+                "POLY_FUNDER equals signer EOA but POLY_SIGNATURE_TYPE is "
+                f"{sig} (proxy/Safe). Set POLY_FUNDER to your Polymarket profile "
+                "deposit address (polymarket.com → Profile / Deposit), not MetaMask EOA.",
+            )
+        if sig == 0:
+            return (
+                False,
+                "POLY_SIGNATURE_TYPE=0 (raw EOA) is often rejected on CLOB v2 "
+                "('deposit wallet flow'). Use type 1 (email login) or 2 (browser wallet) "
+                "with POLY_FUNDER = Polymarket deposit address.",
+            )
+        if summary.get("balance_usdc", 0) <= 0:
+            return (
+                False,
+                f"CLOB balance is $0 for funder={summary.get('funder')} "
+                f"(signature_type={sig}). Check POLY_FUNDER and deposit USDC on Polymarket.",
+            )
+        return True, (
+            f"eoa={summary.get('eoa')} funder={summary.get('funder')} "
+            f"balance=${summary.get('balance_usdc', 0):.2f} signature_type={sig}"
+        )
+
     def verify_clob_ready(self) -> tuple[bool, str]:
         """Lightweight live check: API creds + collateral balance readable."""
+        ok, msg = self.validate_wallet_config()
+        if ok:
+            return True, msg
         try:
             bal = self.wallet_balance_usdc()
             return (
-                True,
-                f"balance=${bal:.2f} funder={self.config.funder} "
-                f"signature_type={self.config.signature_type}",
+                False,
+                f"{msg} (balance_read=${bal:.2f})",
             )
         except Exception as exc:
-            return False, str(exc)
+            return False, f"{msg}; balance read error: {exc}"
 
 
     def _setup_allowances(self) -> None:

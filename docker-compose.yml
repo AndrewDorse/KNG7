@@ -1,4 +1,4 @@
-# KNG7: limit_pair_5m — scheduled dual limits on upcoming BTC 5m windows. Copy .env.example -> .env
+# KNG7: limit_pair_5m — scheduled dual limits on upcoming 5m windows. Copy .env.example -> .env
 services:
   bot:
     build: .
@@ -8,3 +8,8 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./exports:/app/exports
+      # Writable state (appuser); survives restarts even if host ./exports is root-owned.
+      - bot_data:/app/data
+
+volumes:
+  bot_data:

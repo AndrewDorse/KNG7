@@ -82,6 +82,40 @@ def _window_count_from_env() -> int:
     return max(1, int(os.getenv("BOT_LIMIT_PAIR_WINDOW_COUNT", "24")))
 
 
+def _path_writable(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        probe = path.parent / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_state_path() -> Path:
+    """Pick first writable path (Docker default: /app/data)."""
+    raw = (os.getenv("BOT_LIMIT_PAIR_STATE_PATH") or "").strip()
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw))
+    candidates.extend(
+        [
+            Path("/app/data/limit_pair_state.json"),
+            Path("exports/limit_pair_state.json"),
+        ]
+    )
+    seen: set[str] = set()
+    for p in candidates:
+        key = str(p.resolve()) if p.is_absolute() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _path_writable(p):
+            return p
+    return candidates[0]
+
+
 def _is_balance_or_funds_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     needles = (
@@ -131,8 +165,7 @@ class LimitPairEngine:
         self._shares = max(1, int(os.getenv("BOT_LIMIT_PAIR_SHARES", "5")))
         self._price_tol = max(0.001, float(os.getenv("BOT_LIMIT_PAIR_PRICE_TOL", "0.01")))
 
-        state_path = os.getenv("BOT_LIMIT_PAIR_STATE_PATH", "exports/limit_pair_state.json")
-        self._state_path = Path(state_path)
+        self._state_path = _resolve_state_path()
         self._done_slugs: set[str] = set()
         self._contract_cache: dict[str, ActiveContract] = {}
         self._work_list: list[_WindowJob] = []
@@ -153,15 +186,37 @@ class LimitPairEngine:
         self._done_slugs = {str(s) for s in (done or [])}
 
     def _save_state(self) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "symbols": list(self._symbols),
             "done_slugs": sorted(self._done_slugs),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        tmp = self._state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self._state_path)
+        body = json.dumps(payload, indent=2)
+        for attempt in range(3):
+            path = self._state_path
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(body, encoding="utf-8")
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                fallback = Path("/app/data/limit_pair_state.json")
+                if path == fallback and attempt >= 2:
+                    LOGGER.error("state write failed at %s: %s", path, exc)
+                    raise
+                LOGGER.error(
+                    "state write permission denied at %s; switching to %s",
+                    path,
+                    fallback,
+                )
+                _out(f"STATE_FALLBACK path={fallback} (was {path})")
+                self._state_path = fallback
+            except OSError as exc:
+                if attempt >= 2:
+                    raise
+                LOGGER.error("state write failed at %s: %s", self._state_path, exc)
+                self._state_path = _resolve_state_path()
 
     def _job_sort_key(self, job: _WindowJob) -> tuple[int, int]:
         return (job.start_ts, self._sym_rank.get(job.symbol, 99))
@@ -194,7 +249,7 @@ class LimitPairEngine:
             f"lead_min={self._lead_minutes} windows={self._window_count} "
             f"slots={slots}{span} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
-            f"done={len(self._done_slugs)} queue={len(self._work_list)} "
+            f"state={self._state_path} done={len(self._done_slugs)} queue={len(self._work_list)} "
             f"dry_run={self.config.dry_run} "
             f"funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
         )

@@ -36,8 +36,19 @@ Stderr: **`BOT_LOG_LEVEL`** (default **ERROR** in `main.py`).
 1. `cp .env.example .env` — **`POLY_PRIVATE_KEY`**, **`POLY_FUNDER`**, **`POLY_DRY_RUN=false`** for live.  
 2. **`BOT_STRATEGY_MODE=limit_pair_5m`**.  
 3. Network: **HTTPS** `gamma-api.polymarket.com`, `clob.polymarket.com` (optional **WSS** for WS).  
-4. `docker compose build && docker compose up -d`  
-5. `docker compose logs -f bot` — confirm **`INIT`** and periodic **`SEARCH`**.
+4. `docker compose build && docker compose up -d`
+5. `docker compose logs -f bot` — confirm **`INIT`** shows `state=/app/data/...` and periodic **`SEARCH`**.
+
+### Docker permissions
+
+The image **entrypoint** runs briefly as root to `chown` bind-mounted `./logs` and `./exports`, then runs the bot as **`appuser`**. Persistent state defaults to the **`bot_data`** volume at **`/app/data/limit_pair_state.json`** (writable even when host `./exports` is root-owned).
+
+If you still see `PermissionError` on the host mount:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" ./exports ./logs
+docker compose up -d --force-recreate
+```
 
 ## Repo layout
 

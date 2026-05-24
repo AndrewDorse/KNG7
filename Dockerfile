@@ -24,6 +24,7 @@ RUN pip install --upgrade pip && \
 
 COPY main.py /app/main.py
 COPY limit_pair_engine.py /app/limit_pair_engine.py
+COPY check_wallet.py /app/check_wallet.py
 COPY config.py /app/config.py
 COPY trader.py /app/trader.py
 COPY market_locator.py /app/market_locator.py

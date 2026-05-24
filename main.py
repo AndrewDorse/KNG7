@@ -37,7 +37,7 @@ def main() -> int:
 
     from config import BotConfig, BotConfigError  # noqa: PLC0415
     from market_locator import GammaMarketLocator  # noqa: PLC0415
-    from trader import PolymarketTrader  # noqa: PLC0415
+    from trader import PolymarketTrader, wallet_config_hint_for_error  # noqa: PLC0415
 
     from limit_pair_engine import LimitPairEngine  # noqa: PLC0415
 
@@ -62,6 +62,13 @@ def main() -> int:
 
     locator = GammaMarketLocator(config)
     trader = PolymarketTrader(config)
+    if not config.dry_run:
+        ok, detail = trader.verify_clob_ready()
+        if ok:
+            print(f"WALLET_OK {detail}", flush=True)
+        else:
+            print(f"WALLET_WARN {detail}", flush=True)
+            print(wallet_config_hint_for_error(Exception(detail)), flush=True)
     LimitPairEngine(config, locator, trader).run()
     return 0
 

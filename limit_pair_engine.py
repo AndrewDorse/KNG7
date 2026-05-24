@@ -21,7 +21,7 @@ from typing import Any
 
 from config import LOGGER, ActiveContract, BotConfig
 from market_locator import GammaMarketLocator
-from trader import PolymarketTrader
+from trader import PolymarketTrader, is_deposit_wallet_flow_error, wallet_config_hint_for_error
 
 _WINDOW_MINUTES = 5
 _WINDOW_SEC = _WINDOW_MINUTES * 60
@@ -143,6 +143,7 @@ class LimitPairEngine:
         self._contract_cache: dict[str, ActiveContract] = {}
         self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
+        self._wallet_blocked = False
         self._load_state()
 
     def _load_state(self) -> None:
@@ -424,6 +425,9 @@ class LimitPairEngine:
         contract = job.contract
         slug = contract.slug
 
+        if self._wallet_blocked:
+            return _PlaceStatus.NOOP
+
         if slug in self._done_slugs:
             return _PlaceStatus.NOOP
 
@@ -452,6 +456,11 @@ class LimitPairEngine:
                 self._note_submitted(slug, "UP")
             except Exception as exc:
                 had_error = True
+                if is_deposit_wallet_flow_error(exc):
+                    self._wallet_blocked = True
+                    _out(f"WALLET_CONFIG slug={slug} — orders blocked until .env fixed")
+                    LOGGER.error("%s", wallet_config_hint_for_error(exc))
+                    return _PlaceStatus.NOOP
                 if _is_balance_or_funds_error(exc):
                     balance_blocked = True
                 LOGGER.error(
@@ -467,6 +476,11 @@ class LimitPairEngine:
                 self._note_submitted(slug, "DOWN")
             except Exception as exc:
                 had_error = True
+                if is_deposit_wallet_flow_error(exc):
+                    self._wallet_blocked = True
+                    _out(f"WALLET_CONFIG slug={slug} — orders blocked until .env fixed")
+                    LOGGER.error("%s", wallet_config_hint_for_error(exc))
+                    return _PlaceStatus.NOOP
                 if _is_balance_or_funds_error(exc):
                     balance_blocked = True
                 LOGGER.error(

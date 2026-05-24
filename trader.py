@@ -65,6 +65,43 @@ def _is_order_version_mismatch_error(exc: Exception) -> bool:
     return _ORDER_VERSION_MISMATCH_SNIPPET in str(exc).lower()
 
 
+def is_deposit_wallet_flow_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "maker address not allowed" in msg or "deposit wallet flow" in msg
+
+
+def is_api_key_derive_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "could not derive api key" in msg or "derive-api-key" in msg
+
+
+def wallet_config_hint_for_error(exc: BaseException) -> str:
+    """Human-readable fix hints for common Polymarket wallet / CLOB misconfig."""
+    lines = [
+        "",
+        "Wallet / CLOB setup checklist:",
+        "  1. POLY_FUNDER = the address shown on polymarket.com (Profile / Deposit),",
+        "     NOT your MetaMask EOA unless you trade as a raw EOA (rare on CLOB v2).",
+        "  2. POLY_PRIVATE_KEY = private key that controls / signed up that Polymarket account.",
+        "  3. POLY_SIGNATURE_TYPE:",
+        "       1 = email/Magic Polymarket login (proxy wallet)",
+        "       2 = browser wallet + Polymarket Safe/proxy (MetaMask etc.)",
+        "       0 = raw EOA (often rejected: 'use deposit wallet flow' on CLOB v2)",
+        "       3 = new deposit-wallet flow (POLY_1271; requires py_clob_client_v2 support)",
+        "  4. If derive-api-key fails: set RELAYER_API_KEY (+ SECRET + PASSPHRASE from Polymarket),",
+        "     or fix signature_type + funder so create_or_derive_api_creds succeeds.",
+        "  5. Run: python check_wallet.py",
+    ]
+    if is_deposit_wallet_flow_error(exc):
+        lines.insert(
+            1,
+            ">>> CLOB rejected the maker address — funder/signature_type mismatch for this account.",
+        )
+    if is_api_key_derive_error(exc):
+        lines.insert(1, ">>> API key derive failed — check private key + funder + RELAYER_* creds.")
+    return "\n".join(lines)
+
+
 def _normalized_tick_size(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -287,11 +324,30 @@ class PolymarketTrader:
             creds = self.client.derive_api_key()
             if creds is None:
                 raise RuntimeError("derive_api_key returned None")
-        except Exception:
-            creds = self.client.create_api_key(int(time.time() * 1000))
+        except Exception as exc:
+            LOGGER.error("derive_api_key failed: %s", exc)
+            try:
+                creds = self.client.create_api_key(int(time.time() * 1000))
+            except Exception as create_exc:
+                LOGGER.error("create_api_key failed: %s", create_exc)
+                raise RuntimeError(
+                    f"CLOB API credentials failed (derive and create). {create_exc}"
+                ) from create_exc
             if creds is None:
                 raise RuntimeError("create_api_key returned None")
         self.client.set_api_creds(creds)
+
+    def verify_clob_ready(self) -> tuple[bool, str]:
+        """Lightweight live check: API creds + collateral balance readable."""
+        try:
+            bal = self.wallet_balance_usdc()
+            return (
+                True,
+                f"balance=${bal:.2f} funder={self.config.funder} "
+                f"signature_type={self.config.signature_type}",
+            )
+        except Exception as exc:
+            return False, str(exc)
 
 
     def _setup_allowances(self) -> None:

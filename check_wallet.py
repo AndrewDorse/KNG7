@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Verify Polymarket CLOB credentials before running the bot."""
+
+from __future__ import annotations
+
+import sys
+
+from config import BotConfig, BotConfigError
+from trader import PolymarketTrader, wallet_config_hint_for_error
+
+
+def main() -> int:
+    try:
+        config = BotConfig.from_env()
+    except BotConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        return 2
+
+    print("=" * 60)
+    print("KNG7 wallet / CLOB check")
+    print("=" * 60)
+    print(f"POLY_FUNDER:          {config.funder}")
+    print(f"POLY_SIGNATURE_TYPE:  {config.signature_type}")
+    print(f"RELAYER_API_KEY set:  {'yes' if config.relayer_api_key else 'no'}")
+    print(f"POLY_DRY_RUN:         {config.dry_run}")
+    print()
+
+    try:
+        trader = PolymarketTrader(config)
+    except Exception as exc:
+        print(f"FAIL: could not init CLOB client: {exc}")
+        print(wallet_config_hint_for_error(exc))
+        return 1
+
+    ok, detail = trader.verify_clob_ready()
+    if ok:
+        print(f"OK: {detail}")
+        return 0
+
+    print(f"FAIL: {detail}")
+    print(wallet_config_hint_for_error(Exception(detail)))
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

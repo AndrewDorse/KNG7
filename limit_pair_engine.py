@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Schedule GTC limit buys on upcoming BTC 5m UP/DOWN windows.
+Schedule GTC limit buys on upcoming multi-asset 5m UP/DOWN windows.
 
 Every ``search_interval`` seconds:
-  1. Compute the next ``window_count`` five-minute epochs starting
-     ``lead_minutes`` after now (aligned to UTC 5m boundaries).
-  2. Resolve each slug on Gamma and cache contracts.
-  3. Queue windows that are not yet marked sent.
+  1. Compute the next ``window_count`` five-minute epochs (default 24 = 2h)
+     starting ``lead_minutes`` after now (UTC 5m aligned).
+  2. For each symbol (BTC, ETH, SOL, BNB, XRP, …) resolve Gamma slugs and cache.
+  3. Queue windows not yet marked sent.
 
-Drain the queue at ``order_spacing`` seconds per window (UP + DOWN limits).
+Drain the queue at ``order_spacing`` seconds per window pair (UP + DOWN).
 
 Drop cached contracts once both resting orders are confirmed on the CLOB.
-Persist sent/confirmed slugs to disk so restarts do not double-post.
 """
 
 from __future__ import annotations
@@ -30,14 +29,26 @@ from trader import PolymarketTrader
 
 _WINDOW_MINUTES = 5
 _WINDOW_SEC = _WINDOW_MINUTES * 60
+_WINDOWS_PER_HOUR = 60 // _WINDOW_MINUTES  # 12
 
 
 def _out(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _parse_symbols(raw: str | None) -> tuple[str, ...]:
+    s = (raw or "BTC,ETH,SOL,BNB,XRP").strip()
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in s.replace(";", ",").split(","):
+        sym = part.strip().upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return tuple(out) if out else ("BTC",)
+
+
 def _ceil_to_window(ts: int, window_sec: int) -> int:
-    """Smallest epoch >= ts aligned to window_sec."""
     if ts <= 0:
         return 0
     return ((ts + window_sec - 1) // window_sec) * window_sec
@@ -50,15 +61,29 @@ def plan_window_starts(
     window_count: int,
     window_sec: int = _WINDOW_SEC,
 ) -> list[int]:
-    """UTC 5m epochs for the next hour block after lead time (default 12 windows)."""
+    """UTC 5m epochs for the scheduled block after lead time."""
     anchor = int(now_ts) + int(lead_minutes) * 60
     first = _ceil_to_window(anchor, window_sec)
     n = max(0, int(window_count))
     return [first + i * window_sec for i in range(n)]
 
 
+def _window_count_from_env() -> int:
+    """``BOT_LIMIT_PAIR_WINDOW_COUNT`` or ``BOT_LIMIT_PAIR_HOURS`` × 12 (5m windows/hour)."""
+    raw_hours = os.getenv("BOT_LIMIT_PAIR_HOURS")
+    if raw_hours not in (None, ""):
+        try:
+            hours = float(raw_hours)
+            if hours > 0:
+                return max(1, int(round(hours * _WINDOWS_PER_HOUR)))
+        except ValueError:
+            pass
+    return max(1, int(os.getenv("BOT_LIMIT_PAIR_WINDOW_COUNT", "24")))
+
+
 @dataclass(slots=True)
 class _WindowJob:
+    symbol: str
     start_ts: int
     contract: ActiveContract
 
@@ -74,8 +99,9 @@ class LimitPairEngine:
         self.locator = locator
         self.trader = trader
 
+        self._symbols = _parse_symbols(os.getenv("BOT_LIMIT_PAIR_SYMBOLS"))
         self._lead_minutes = max(0, int(os.getenv("BOT_LIMIT_PAIR_LEAD_MINUTES", "15")))
-        self._window_count = max(1, int(os.getenv("BOT_LIMIT_PAIR_WINDOW_COUNT", "12")))
+        self._window_count = _window_count_from_env()
         self._search_interval = max(
             30.0, float(os.getenv("BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC", "300"))
         )
@@ -112,6 +138,7 @@ class LimitPairEngine:
     def _save_state(self) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "symbols": list(self._symbols),
             "sent_slugs": sorted(self._sent_slugs),
             "confirmed_slugs": sorted(self._confirmed_slugs),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -132,26 +159,27 @@ class LimitPairEngine:
             t1 = datetime.fromtimestamp(
                 starts[-1] + _WINDOW_SEC, tz=timezone.utc
             ).strftime("%H:%M")
-            span = f" next_block={t0}-{t1}Z"
+            span = f" block={t0}-{t1}Z"
+        sym_s = ",".join(self._symbols)
+        slots = len(starts) * len(self._symbols)
         _out(
             "INIT "
-            f"strategy=limit_pair_5m "
+            f"strategy=limit_pair_5m symbols={sym_s} "
             f"up={self._up_px:g} down={self._down_px:g} shares={self._shares} "
             f"lead_min={self._lead_minutes} windows={self._window_count} "
-            f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g}"
-            f"{span} "
+            f"slots={slots}{span} "
+            f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
             f"sent={len(self._sent_slugs)} confirmed={len(self._confirmed_slugs)} "
             f"dry_run={self.config.dry_run} "
             f"funder={self.config.funder[:6]}…{self.config.funder[-4:]}"
         )
 
     def _prune_confirmed_cache(self) -> None:
-        drop = [s for s in self._contract_cache if s in self._confirmed_slugs]
-        for slug in drop:
-            del self._contract_cache[slug]
+        for slug in list(self._contract_cache):
+            if slug in self._confirmed_slugs:
+                del self._contract_cache[slug]
 
     def _reconcile_confirmed(self) -> None:
-        """Promote sent → confirmed when both limits are visible on the CLOB."""
         if self.config.dry_run:
             return
         changed = False
@@ -184,13 +212,14 @@ class LimitPairEngine:
         if self.config.dry_run:
             return True
         if open_orders is None:
-            if self.trader.has_open_limit_buy_near(
-                contract.up.token_id, self._up_px, tol=self._price_tol
-            ) and self.trader.has_open_limit_buy_near(
-                contract.down.token_id, self._down_px, tol=self._price_tol
-            ):
-                return True
-            return False
+            return (
+                self.trader.has_open_limit_buy_near(
+                    contract.up.token_id, self._up_px, tol=self._price_tol
+                )
+                and self.trader.has_open_limit_buy_near(
+                    contract.down.token_id, self._down_px, tol=self._price_tol
+                )
+            )
         return self._token_has_buy_near(
             open_orders, contract.up.token_id, self._up_px
         ) and self._token_has_buy_near(
@@ -234,29 +263,46 @@ class LimitPairEngine:
             lead_minutes=self._lead_minutes,
             window_count=self._window_count,
         )
+        sym_rank = {s: i for i, s in enumerate(self._symbols)}
         found = 0
         queued = 0
+        new_jobs: list[_WindowJob] = []
+
         for start_ts in targets:
             if start_ts + _WINDOW_SEC <= now_ts:
                 continue
-            contract = self.locator.get_contract_for_window_start(
-                _WINDOW_MINUTES, start_ts
-            )
-            if contract is None:
-                continue
-            slug = contract.slug
-            found += 1
-            self._contract_cache[slug] = contract
-            if slug in self._sent_slugs or slug in self._confirmed_slugs:
-                continue
-            if any(j.contract.slug == slug for j in self._pending_jobs):
-                continue
-            self._pending_jobs.append(_WindowJob(start_ts=start_ts, contract=contract))
-            queued += 1
+            for symbol in self._symbols:
+                contract = self.locator.get_contract_for_window_start(
+                    _WINDOW_MINUTES,
+                    start_ts,
+                    market_symbol=symbol,
+                )
+                if contract is None:
+                    continue
+                slug = contract.slug
+                found += 1
+                self._contract_cache[slug] = contract
+                if slug in self._sent_slugs or slug in self._confirmed_slugs:
+                    continue
+                if any(j.contract.slug == slug for j in self._pending_jobs):
+                    continue
+                if any(j.contract.slug == slug for j in new_jobs):
+                    continue
+                new_jobs.append(
+                    _WindowJob(symbol=symbol, start_ts=start_ts, contract=contract)
+                )
+                queued += 1
+
+        if new_jobs:
+            new_jobs.sort(key=lambda j: (j.start_ts, sym_rank.get(j.symbol, 99)))
+            self._pending_jobs.extend(new_jobs)
+
+        target_slots = len(targets) * len(self._symbols)
         if found or queued:
             _out(
-                f"SEARCH targets={len(targets)} resolved={found} "
-                f"queued={queued} pending={len(self._pending_jobs)}"
+                f"SEARCH epochs={len(targets)} symbols={len(self._symbols)} "
+                f"slots={target_slots} resolved={found} queued={queued} "
+                f"pending={len(self._pending_jobs)}"
             )
         self.trader.sync_ws_subscriptions(list(self._contract_cache.values()))
 
@@ -279,9 +325,7 @@ class LimitPairEngine:
             contract.up.token_id, self._up_px, tol=self._price_tol
         ):
             try:
-                self.trader.place_limit_buy(
-                    contract.up, self._up_px, self._shares
-                )
+                self.trader.place_limit_buy(contract.up, self._up_px, self._shares)
                 placed_any = True
             except Exception as exc:
                 LOGGER.error(
@@ -295,9 +339,7 @@ class LimitPairEngine:
             contract.down.token_id, self._down_px, tol=self._price_tol
         ):
             try:
-                self.trader.place_limit_buy(
-                    contract.down, self._down_px, self._shares
-                )
+                self.trader.place_limit_buy(contract.down, self._down_px, self._shares)
                 placed_any = True
             except Exception as exc:
                 LOGGER.error(
@@ -308,11 +350,7 @@ class LimitPairEngine:
                     exc,
                 )
 
-        # Mark sent once we attempted (or orders already exist) so we do not spam.
-        if (
-            placed_any
-            or self._both_limits_present(contract)
-        ):
+        if placed_any or self._both_limits_present(contract):
             self._sent_slugs.add(slug)
             self._save_state()
             _out(

@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-05-24-limit-pair-5m
+ARG KNG7_IMAGE_TAG=2026-05-24-limit-pair-multi-5m
 LABEL org.opencontainers.image.title="KNG7 limit_pair_5m" \
-      org.opencontainers.image.description="Docker: scheduled BTC 5m UP/DOWN GTC limits (50c/49c)" \
+      org.opencontainers.image.description="Docker: scheduled multi-asset 5m UP/DOWN GTC limits (50c/49c)" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

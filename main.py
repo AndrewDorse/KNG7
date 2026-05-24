@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KNG7 Docker: **limit_pair_5m** — schedule UP/DOWN GTC limits on upcoming BTC 5m windows."""
+"""KNG7 Docker: **limit_pair_5m** — schedule UP/DOWN GTC limits on upcoming multi-asset 5m windows."""
 
 from __future__ import annotations
 

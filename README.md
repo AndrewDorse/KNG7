@@ -2,9 +2,9 @@
 
 Places **two GTC limit buys** on each upcoming **5m** Polymarket UP/DOWN window for multiple assets:
 
-- **Symbols:** `BTC, ETH, SOL, BNB, XRP` (`BOT_LIMIT_PAIR_SYMBOLS`)
-- **UP** @ **50¢** × **5** shares  
-- **DOWN** @ **49¢** × **5** shares  
+- **Symbols:** `BTC, ETH` (`BOT_LIMIT_PAIR_SYMBOLS`)
+- **UP** @ **50¢** × **10** shares  
+- **DOWN** @ **49¢** × **10** shares  
 
 Gamma slugs: `{sym}-updown-5m-<epoch>` (UTC window start).
 
@@ -13,7 +13,7 @@ Gamma slugs: `{sym}-updown-5m-<epoch>` (UTC window start).
 Every **`BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC`** (default **300** = 5 minutes):
 
 1. Compute **`BOT_LIMIT_PAIR_HOURS`** (default **2**) or **`BOT_LIMIT_PAIR_WINDOW_COUNT`** epochs (24 for 2h) starting at the next 5m boundary **after** `now + BOT_LIMIT_PAIR_LEAD_MINUTES` (default **15**).
-2. Example: now **07:53** → first window **08:10** UTC, last window ends **10:10** (24 × 5m × 5 symbols = **120** order pairs max per full scan).
+2. Example: now **07:53** → first window **08:10** UTC, last window ends **10:10** (24 × 5m × 2 symbols = **48** order pairs max per full scan).
 3. Resolve each slug on Gamma; cache contracts.
 4. Queue windows not yet in `exports/limit_pair_state.json`.
 5. Place **one window pair** (UP + DOWN), then wait **`BOT_LIMIT_PAIR_ORDER_SPACING_SEC`** (default **10**) before the next — no burst posting.

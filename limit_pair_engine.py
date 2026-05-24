@@ -40,7 +40,7 @@ def _out(msg: str) -> None:
 
 
 def _parse_symbols(raw: str | None) -> tuple[str, ...]:
-    s = (raw or "BTC,ETH,SOL,BNB,XRP").strip()
+    s = (raw or "BTC,ETH").strip()
     out: list[str] = []
     seen: set[str] = set()
     for part in s.replace(";", ",").split(","):
@@ -162,7 +162,7 @@ class LimitPairEngine:
         )
         self._up_px = round(float(os.getenv("BOT_LIMIT_PAIR_UP_PX", "0.50")), 2)
         self._down_px = round(float(os.getenv("BOT_LIMIT_PAIR_DOWN_PX", "0.49")), 2)
-        self._shares = max(1, int(os.getenv("BOT_LIMIT_PAIR_SHARES", "5")))
+        self._shares = max(1, int(os.getenv("BOT_LIMIT_PAIR_SHARES", "10")))
         self._price_tol = max(0.001, float(os.getenv("BOT_LIMIT_PAIR_PRICE_TOL", "0.01")))
 
         self._state_path = _resolve_state_path()

@@ -1045,6 +1045,26 @@ class PolymarketTrader:
         signed = self.client.create_order(order)
         return self.client.post_order(signed, OrderType.FAK)
 
+    def flatten_conditional_at_price(
+        self,
+        token: TokenMarket,
+        price: float,
+        *,
+        max_rounds: int = 8,
+        position_eps: float = 0.01,
+        pause_sec: float = 0.35,
+    ) -> tuple[bool, float]:
+        """FAK-sell until ``token`` balance is below ``position_eps`` or rounds exhausted."""
+        last_pos = 0.0
+        for _ in range(max(1, int(max_rounds))):
+            last_pos = self.token_balance_allowance_refreshed(token.token_id)
+            if last_pos < position_eps:
+                return True, last_pos
+            self.place_marketable_sell(token, price, last_pos)
+            time.sleep(max(0.1, float(pause_sec)))
+        last_pos = self.token_balance_allowance_refreshed(token.token_id)
+        return last_pos < position_eps, last_pos
+
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
@@ -1192,7 +1212,7 @@ class PolymarketTrader:
         order_id: str,
         *,
         open_orders: list[dict[str, Any]] | None = None,
-        max_wait_sec: float = 4.0,
+        max_wait_sec: float = 6.0,
     ) -> bool:
         """Cancel and poll until the order is gone or status is CANCELLED."""
         oid = str(order_id or "").strip()

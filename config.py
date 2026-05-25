@@ -353,8 +353,11 @@ class BotConfig:
     limit_pair_price_tol: float = 0.01
     # At start_ts + offset: cancel window orders, market-sell positions (default T+15s).
     limit_pair_window_cleanup_offset_sec: int = 15
-    limit_pair_exit_sell_price: float = 0.99
-    limit_pair_cleanup_verify_rounds: int = 3
+    limit_pair_window_cleanup_until_sec: int = 60
+    # Aggressive exit: sell at 1¢ to cross the bid book (not 99¢).
+    limit_pair_exit_sell_price: float = 0.01
+    limit_pair_cleanup_poll_sec: float = 1.0
+    limit_pair_cleanup_sell_max_rounds: int = 8
 
     @property
     def window_minutes(self) -> int:
@@ -760,12 +763,19 @@ class BotConfig:
             limit_pair_window_cleanup_offset_sec=max(
                 1, _env_int("BOT_LIMIT_PAIR_WINDOW_CLEANUP_OFFSET_SEC", 15)
             ),
+            limit_pair_window_cleanup_until_sec=max(
+                16,
+                _env_int("BOT_LIMIT_PAIR_WINDOW_CLEANUP_UNTIL_SEC", 60),
+            ),
             limit_pair_exit_sell_price=min(
                 0.99,
-                max(0.01, round(_env_float("BOT_LIMIT_PAIR_EXIT_SELL_PX", 0.99), 2)),
+                max(0.01, round(_env_float("BOT_LIMIT_PAIR_EXIT_SELL_PX", 0.01), 2)),
             ),
-            limit_pair_cleanup_verify_rounds=max(
-                1, _env_int("BOT_LIMIT_PAIR_CLEANUP_VERIFY_ROUNDS", 3)
+            limit_pair_cleanup_poll_sec=max(
+                0.5, _env_float("BOT_LIMIT_PAIR_CLEANUP_POLL_SEC", 1.0)
+            ),
+            limit_pair_cleanup_sell_max_rounds=max(
+                1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
         )
         if cfg.strategy_mode in ("paladin_v7", "paladin_v9") and (

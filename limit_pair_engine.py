@@ -4,7 +4,8 @@ Schedule GTC limit buys on upcoming multi-asset 5m UP/DOWN windows.
 
 Work list (closest window start first):
   - Every ``search_interval``: refresh target epochs, append new slots, re-sort.
-  - Drop a slot once **both** UP and DOWN limits are on the CLOB.
+  - Drop a slot once **both** UP and DOWN have resting limits and/or filled position.
+  - Post a leg only when that token has **no** resting buy and **no** position.
   - Each ``order_spacing`` cycle: try the **top** slot only; on balance/placement
     error, keep it at the front and retry after ``order_spacing`` (funds may free up).
 """
@@ -26,6 +27,8 @@ from trader import PolymarketTrader, is_deposit_wallet_flow_error, wallet_config
 _WINDOW_MINUTES = 5
 _WINDOW_SEC = _WINDOW_MINUTES * 60
 _WINDOWS_PER_HOUR = 60 // _WINDOW_MINUTES  # 12
+# Min conditional balance to treat as "has position" (avoid dust reposts).
+_POSITION_EPS = 0.01
 
 
 class _PlaceStatus(Enum):
@@ -288,57 +291,80 @@ class LimitPairEngine:
         self._submitted_legs.setdefault(slug, set()).add(leg.strip().upper())
         self._save_state()
 
-    def _leg_resting_shares(
+    def _leg_resting_any(
+        self, token_id: str, open_orders: list[dict[str, Any]]
+    ) -> float:
+        return self.trader.resting_buy_shares_on_token(
+            token_id, open_orders=open_orders
+        )
+
+    def _leg_resting_near(
         self, token_id: str, price: float, open_orders: list[dict[str, Any]]
     ) -> float:
         return self.trader.resting_buy_shares_near(
             token_id, price, tol=self._price_tol, open_orders=open_orders
         )
 
-    def _leg_on_book(
-        self, token_id: str, price: float, open_orders: list[dict[str, Any]]
-    ) -> bool:
-        return self._leg_resting_shares(token_id, price, open_orders) >= float(self._shares) - 1e-6
+    def _leg_position_shares(self, token_id: str) -> float:
+        try:
+            return max(0.0, float(self.trader.token_balance(token_id)))
+        except Exception as exc:
+            LOGGER.debug("token_balance %s: %s", token_id[:16], exc)
+            return 0.0
 
-    def _leg_should_skip_post(
+    def _leg_covered(
         self,
-        slug: str,
-        leg: str,
         token_id: str,
-        price: float,
         open_orders: list[dict[str, Any]],
+        *,
+        position_shares: float | None = None,
     ) -> bool:
-        """True when we should NOT post another limit for this leg."""
-        leg_u = leg.strip().upper()
-        resting = self._leg_resting_shares(token_id, price, open_orders)
-        if resting >= float(self._shares) - 1e-6:
+        """True when this side already has a resting buy and/or filled position."""
+        resting = self._leg_resting_any(token_id, open_orders)
+        if resting > 1e-6:
             return True
-        submitted = self._submitted_legs.get(slug, set())
-        if leg_u in submitted:
-            # POST accepted; book may lag — do not stack duplicate orders.
-            return True
-        return False
+        pos = (
+            position_shares
+            if position_shares is not None
+            else self._leg_position_shares(token_id)
+        )
+        return pos >= _POSITION_EPS
 
-    def _up_on_book(
-        self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
+    def _leg_should_post(
+        self,
+        token_id: str,
+        open_orders: list[dict[str, Any]],
+        *,
+        position_shares: float | None = None,
     ) -> bool:
-        return self._leg_on_book(contract.up.token_id, self._up_px, open_orders)
-
-    def _down_on_book(
-        self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
-    ) -> bool:
-        return self._leg_on_book(contract.down.token_id, self._down_px, open_orders)
+        """Post only when no resting order and no position on this token."""
+        return not self._leg_covered(
+            token_id, open_orders, position_shares=position_shares
+        )
 
     def _pair_complete(
         self,
         slug: str,
         contract: ActiveContract,
         open_orders: list[dict[str, Any]],
+        *,
+        up_pos: float | None = None,
+        down_pos: float | None = None,
     ) -> bool:
         if self.config.dry_run:
             return slug in self._done_slugs
-        return self._up_on_book(slug, contract, open_orders) and self._down_on_book(
-            slug, contract, open_orders
+        up_position = (
+            up_pos if up_pos is not None else self._leg_position_shares(contract.up.token_id)
+        )
+        down_position = (
+            down_pos
+            if down_pos is not None
+            else self._leg_position_shares(contract.down.token_id)
+        )
+        return self._leg_covered(
+            contract.up.token_id, open_orders, position_shares=up_position
+        ) and self._leg_covered(
+            contract.down.token_id, open_orders, position_shares=down_position
         )
 
     def _trim_excess_for_contract(
@@ -389,7 +415,11 @@ class LimitPairEngine:
             slug = job.contract.slug
             if slug in self._done_slugs:
                 continue
-            if self._pair_complete(slug, job.contract, open_orders):
+            up_pos = self._leg_position_shares(job.contract.up.token_id)
+            down_pos = self._leg_position_shares(job.contract.down.token_id)
+            if self._pair_complete(
+                slug, job.contract, open_orders, up_pos=up_pos, down_pos=down_pos
+            ):
                 self._mark_done(slug)
                 _out(f"DONE slug={slug} up={self._up_px:g} down={self._down_px:g}")
 
@@ -431,16 +461,6 @@ class LimitPairEngine:
         self._sort_work_list()
         self._prune_work_list()
 
-        # Re-queued slots get a fresh post attempt each SEARCH (easier restart / recovery).
-        queued_slugs = {j.contract.slug for j in self._work_list}
-        cleared = 0
-        for slug in list(self._submitted_legs):
-            if slug in queued_slugs and slug not in self._done_slugs:
-                del self._submitted_legs[slug]
-                cleared += 1
-        if cleared:
-            self._save_state()
-
         top = ""
         if self._work_list:
             j = self._work_list[0]
@@ -448,14 +468,11 @@ class LimitPairEngine:
                 f" next={j.contract.slug} "
                 f"@{datetime.fromtimestamp(j.start_ts, tz=timezone.utc).strftime('%H:%M')}Z"
             )
-        cleared_s = ""
-        if cleared:
-            cleared_s = f" cleared_submitted={cleared}"
         _out(
             f"SEARCH horizon_min={self._horizon_minutes} skip={skip_n} "
             f"epochs={len(future_starts)} active={len(active_starts)} "
             f"resolved={resolved} gamma_miss={gamma_miss} "
-            f"queue={len(self._work_list)} done={len(self._done_slugs)}{cleared_s}{top}"
+            f"queue={len(self._work_list)} done={len(self._done_slugs)}{top}"
         )
         self.trader.sync_ws_subscriptions(list(self._contract_cache.values()))
 
@@ -492,44 +509,42 @@ class LimitPairEngine:
             return _PlaceStatus.COMPLETE
 
         open_orders = self._fetch_open_orders()
+        up_pos = self._leg_position_shares(contract.up.token_id)
+        down_pos = self._leg_position_shares(contract.down.token_id)
         self._trim_excess_for_contract(slug, contract, open_orders)
 
-        if self._pair_complete(slug, contract, open_orders):
+        if self._pair_complete(
+            slug, contract, open_orders, up_pos=up_pos, down_pos=down_pos
+        ):
             self._mark_done(slug)
-            _out(f"DONE slug={slug} (both limits already on book)")
+            _out(
+                f"DONE slug={slug} up_rest={self._leg_resting_any(contract.up.token_id, open_orders):g} "
+                f"up_pos={up_pos:g} down_rest={self._leg_resting_any(contract.down.token_id, open_orders):g} "
+                f"down_pos={down_pos:g}"
+            )
             return _PlaceStatus.COMPLETE
 
         had_error = False
         balance_blocked = False
+        placed_any = False
 
-        if not self._leg_should_skip_post(
-            slug, "UP", contract.up.token_id, self._up_px, open_orders
+        for leg, token, px, pos in (
+            ("UP", contract.up, self._up_px, up_pos),
+            ("DOWN", contract.down, self._down_px, down_pos),
         ):
-            try:
-                self.trader.place_limit_buy(contract.up, self._up_px, self._shares)
-                self._note_submitted(slug, "UP")
-            except Exception as exc:
-                had_error = True
-                if is_deposit_wallet_flow_error(exc):
-                    self._wallet_blocked = True
-                    _out(f"WALLET_CONFIG slug={slug} — orders blocked until .env fixed")
-                    LOGGER.error("%s", wallet_config_hint_for_error(exc))
-                    return _PlaceStatus.NOOP
-                if _is_balance_or_funds_error(exc):
-                    balance_blocked = True
-                LOGGER.error(
-                    "[LIMIT_PAIR] %s UP $%.2f x %d failed: %s",
-                    slug,
-                    self._up_px,
-                    self._shares,
-                    exc,
+            rest_any = self._leg_resting_any(token.token_id, open_orders)
+            if not self._leg_should_post(
+                token.token_id, open_orders, position_shares=pos
+            ):
+                _out(
+                    f"SKIP_POST slug={slug} {leg} resting={rest_any:g} pos={pos:g}"
                 )
-        if not self._leg_should_skip_post(
-            slug, "DOWN", contract.down.token_id, self._down_px, open_orders
-        ):
+                continue
             try:
-                self.trader.place_limit_buy(contract.down, self._down_px, self._shares)
-                self._note_submitted(slug, "DOWN")
+                self.trader.place_limit_buy(token, px, self._shares)
+                self._note_submitted(slug, leg)
+                placed_any = True
+                _out(f"POST slug={slug} {leg} ${px:g}x{self._shares}")
             except Exception as exc:
                 had_error = True
                 if is_deposit_wallet_flow_error(exc):
@@ -540,46 +555,54 @@ class LimitPairEngine:
                 if _is_balance_or_funds_error(exc):
                     balance_blocked = True
                 LOGGER.error(
-                    "[LIMIT_PAIR] %s DOWN $%.2f x %d failed: %s",
+                    "[LIMIT_PAIR] %s %s $%.2f x %d failed: %s",
                     slug,
-                    self._down_px,
+                    leg,
+                    px,
                     self._shares,
                     exc,
                 )
 
         open_orders = self._fetch_open_orders()
+        up_pos = self._leg_position_shares(contract.up.token_id)
+        down_pos = self._leg_position_shares(contract.down.token_id)
         self._trim_excess_for_contract(slug, contract, open_orders)
 
-        if self._pair_complete(slug, contract, open_orders):
+        if self._pair_complete(
+            slug, contract, open_orders, up_pos=up_pos, down_pos=down_pos
+        ):
             self._mark_done(slug)
-            _out(
-                f"ORDER slug={slug} UP ${self._up_px:g}x{self._shares} "
-                f"DOWN ${self._down_px:g}x{self._shares}"
-            )
+            _out(f"DONE slug={slug} after post")
             return _PlaceStatus.COMPLETE
 
         if had_error:
-            up_rest = self.trader.resting_buy_shares_near(
-                contract.up.token_id, self._up_px, tol=self._price_tol, open_orders=open_orders
-            )
-            down_rest = self.trader.resting_buy_shares_near(
-                contract.down.token_id,
-                self._down_px,
-                tol=self._price_tol,
-                open_orders=open_orders,
-            )
             why = "balance" if balance_blocked else "error"
             _out(
                 f"RETRY_{why.upper()} slug={slug} "
-                f"up={up_rest:g}/{self._shares} down={down_rest:g}/{self._shares} "
-                f"in={self._order_spacing:g}s"
+                f"up_rest={self._leg_resting_any(contract.up.token_id, open_orders):g} "
+                f"up_pos={up_pos:g} "
+                f"down_rest={self._leg_resting_any(contract.down.token_id, open_orders):g} "
+                f"down_pos={down_pos:g} in={self._order_spacing:g}s"
             )
             return _PlaceStatus.RETRY
 
-        # Book still catching up after successful POST — wait, do not stack orders.
+        if not placed_any:
+            _out(
+                f"ADVANCE slug={slug} both sides covered "
+                f"up_rest={self._leg_resting_any(contract.up.token_id, open_orders):g} "
+                f"up_pos={up_pos:g} "
+                f"down_rest={self._leg_resting_any(contract.down.token_id, open_orders):g} "
+                f"down_pos={down_pos:g}"
+            )
+            self._mark_done(slug)
+            return _PlaceStatus.COMPLETE
+
         _out(
-            f"WAIT_BOOK slug={slug} in={self._order_spacing:g}s "
-            f"(submitted, confirming on CLOB)"
+            f"PENDING slug={slug} in={self._order_spacing:g}s "
+            f"up_rest={self._leg_resting_any(contract.up.token_id, open_orders):g} "
+            f"up_pos={up_pos:g} "
+            f"down_rest={self._leg_resting_any(contract.down.token_id, open_orders):g} "
+            f"down_pos={down_pos:g}"
         )
         return _PlaceStatus.RETRY
 
@@ -590,9 +613,11 @@ class LimitPairEngine:
         job = self._work_list[0]
         status = self._place_window_pair(job)
         if status == _PlaceStatus.COMPLETE:
-            # _mark_done already removed slug from work_list
-            pass
-        # RETRY: keep job at index 0 — do not pop
+            return status
+        if status == _PlaceStatus.RETRY:
+            # If another queued window is closer in time, don't block the whole bot on one slug.
+            if len(self._work_list) > 1:
+                self._work_list.append(self._work_list.pop(0))
         return status
 
     def run(self) -> None:

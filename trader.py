@@ -52,7 +52,11 @@ if not _CLOB_V2:
     OrderPayload = None
 
 from config import (
-    HOST, CHAIN_ID, BUY, SELL, LOGGER,
+    HOST,
+    CHAIN_ID,
+    BUY,
+    SELL,
+    LOGGER,
     ActiveContract,
     BotConfig,
     TokenMarket,
@@ -1036,13 +1040,19 @@ class PolymarketTrader:
             size=_clob_taker_size_shares(size),
             side=self._sell_side,
         )
+        opts = self._market_order_options_for_token(token)
         create_and_post = getattr(self.client, "create_and_post_order", None)
         if callable(create_and_post):
             try:
-                return create_and_post(order_args=order, options=None, order_type=OrderType.FAK, post_only=False)
+                return create_and_post(
+                    order_args=order,
+                    options=opts,
+                    order_type=OrderType.FAK,
+                    post_only=False,
+                )
             except TypeError:
-                return create_and_post(order, None, OrderType.FAK)
-        signed = self.client.create_order(order)
+                return create_and_post(order, opts, OrderType.FAK)
+        signed = self.client.create_order(order, options=opts)
         return self.client.post_order(signed, OrderType.FAK)
 
     def flatten_conditional_at_price(
@@ -1190,12 +1200,15 @@ class PolymarketTrader:
         """Cancel a single order by ID. Returns True on success."""
         try:
             if hasattr(self.client, "cancel_order"):
-                self.client.cancel_order(OrderPayload(orderID=order_id))
+                if OrderPayload is not None:
+                    self.client.cancel_order(OrderPayload(orderID=order_id))
+                else:
+                    self.client.cancel_order(order_id)
             else:
                 self.client.cancel(order_id)
             return True
         except Exception as exc:
-            LOGGER.debug("Cancel failed %s: %s", order_id, exc)
+            LOGGER.error("Cancel failed %s: %s", order_id, exc)
             return False
 
     def _order_status_upper(self, order_id: str) -> str:
@@ -1282,6 +1295,66 @@ class PolymarketTrader:
             if oid and self.cancel_order_confirmed(oid, open_orders=None):
                 confirmed += 1
         return confirmed, len(orders)
+
+    def flatten_window_contract(
+        self,
+        contract: ActiveContract,
+        exit_price: float,
+        *,
+        max_sell_rounds: int = 8,
+        position_eps: float = 0.01,
+    ) -> dict[str, Any]:
+        """
+        Cancel every open order and FAK-sell every position on this window's UP/DOWN tokens.
+        """
+        token_ids = {contract.up.token_id, contract.down.token_id}
+        cancel_attempted = 0
+        cancel_confirmed = 0
+        sell_attempts: list[str] = []
+
+        open_orders = self.get_open_orders()
+        for tid in token_ids:
+            c_ok, c_att = self.cancel_token_orders_confirmed(
+                tid, open_orders=open_orders
+            )
+            cancel_confirmed += c_ok
+            cancel_attempted += c_att
+            open_orders = self.get_open_orders()
+
+        for token in (contract.up, contract.down):
+            ok, pos_after = self.flatten_conditional_at_price(
+                token,
+                exit_price,
+                max_rounds=max_sell_rounds,
+                position_eps=position_eps,
+            )
+            sell_attempts.append(f"{token.outcome}:ok={ok},pos={pos_after:g}")
+
+        open_orders = self.get_open_orders()
+        up_rest = self.resting_order_shares_on_token(
+            contract.up.token_id, open_orders=open_orders
+        )
+        down_rest = self.resting_order_shares_on_token(
+            contract.down.token_id, open_orders=open_orders
+        )
+        up_pos = self.token_balance_allowance_refreshed(contract.up.token_id)
+        down_pos = self.token_balance_allowance_refreshed(contract.down.token_id)
+        flat = (
+            up_rest <= 1e-6
+            and down_rest <= 1e-6
+            and up_pos < position_eps
+            and down_pos < position_eps
+        )
+        return {
+            "flat": flat,
+            "cancel_confirmed": cancel_confirmed,
+            "cancel_attempted": cancel_attempted,
+            "up_rest": up_rest,
+            "down_rest": down_rest,
+            "up_pos": up_pos,
+            "down_pos": down_pos,
+            "sells": sell_attempts,
+        }
 
     @_retry()
     def get_order(self, order_id: str) -> dict[str, Any]:

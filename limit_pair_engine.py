@@ -6,7 +6,7 @@ Work list (closest window start first):
   - Every ``search_interval``: refresh target epochs, append new slots, re-sort.
   - Drop a slot once **both** UP and DOWN have resting limits and/or filled position.
   - Post a leg only when that token has **no** resting buy and **no** position.
-  - **T+15…T+60:** if exactly **one** leg of that window is filled → cancel **unfilled** leg orders only, sell **filled** leg @ 1¢.
+  - **T+15…T+60:** one-side risk (position + other leg still on book) → **cancel all** window orders + **sell all** positions @ 1¢ FAK, poll 1s until clear.
   - Each ``order_spacing`` cycle: try the **top** slot only; on balance/placement
     error, keep it at the front and retry after ``order_spacing`` (funds may free up).
 """
@@ -190,6 +190,7 @@ class LimitPairEngine:
         self._cleanup_poll_sec = lp.limit_pair_cleanup_poll_sec
         self._cleanup_sell_rounds = lp.limit_pair_cleanup_sell_max_rounds
         self._cleanup_armed_slugs: set[str] = set()
+        self._cleanup_flatten_active: set[str] = set()
         self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
         self._wallet_blocked = False
@@ -220,6 +221,8 @@ class LimitPairEngine:
                     }
         cleaned = raw.get("cleanup_done_slugs") or []
         self._cleanup_done_slugs = {str(s) for s in cleaned}
+        flatten_active = raw.get("cleanup_flatten_active") or []
+        self._cleanup_flatten_active = {str(s) for s in flatten_active}
 
     def _save_state(self) -> None:
         payload = {
@@ -229,6 +232,7 @@ class LimitPairEngine:
                 slug: sorted(legs) for slug, legs in sorted(self._submitted_legs.items())
             },
             "cleanup_done_slugs": sorted(self._cleanup_done_slugs),
+            "cleanup_flatten_active": sorted(self._cleanup_flatten_active),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         body = json.dumps(payload, indent=2)
@@ -440,19 +444,45 @@ class LimitPairEngine:
             or 0
         )
 
+    def _contract_for_slug(self, slug: str) -> ActiveContract | None:
+        if slug in self._contract_cache:
+            return self._contract_cache[slug]
+        start = _slug_window_start(slug)
+        if start is None:
+            return None
+        sym = str(slug).split("-")[0].upper()
+        if sym not in self._symbols:
+            return None
+        contract = self.locator.get_contract_for_window_start(
+            _WINDOW_MINUTES, start, market_symbol=sym
+        )
+        if contract is not None:
+            self._contract_cache[slug] = contract
+            self._window_start_by_slug[slug] = start
+        return contract
+
     def _contracts_due_cleanup(
         self, now_ts: int
     ) -> list[tuple[str, ActiveContract, int]]:
-        """Windows in the T+offset … end cleanup phase (poll until flat)."""
+        """Windows in T+offset…T+until (and flatten-active until flat)."""
+        slug_keys = (
+            set(self._contract_cache)
+            | set(self._submitted_legs)
+            | self._cleanup_flatten_active
+        )
         due: list[tuple[str, ActiveContract, int]] = []
-        for slug, contract in list(self._contract_cache.items()):
+        for slug in slug_keys:
             if slug in self._cleanup_done_slugs:
+                continue
+            contract = self._contract_for_slug(slug)
+            if contract is None:
                 continue
             start = self._window_start_for(slug, contract)
             if start <= 0:
                 continue
             trigger = start + self._cleanup_offset_sec
-            if trigger <= now_ts < start + _WINDOW_SEC:
+            in_window = trigger <= now_ts < start + _WINDOW_SEC
+            if in_window or slug in self._cleanup_flatten_active:
                 due.append((slug, contract, start))
         due.sort(key=lambda x: x[2])
         return due
@@ -462,26 +492,8 @@ class LimitPairEngine:
         return self._cleanup_offset_sec <= elapsed < self._cleanup_until_sec
 
     def _cleanup_phase_active(self, now_ts: int | None = None) -> bool:
-        """True while a window is in T+15…T+60 *and* exactly one leg is filled."""
-        now_ts = int(now_ts if now_ts is not None else time.time())
-        for slug, contract in self._contract_cache.items():
-            if slug in self._cleanup_done_slugs:
-                continue
-            start = self._window_start_for(slug, contract)
-            if start <= 0:
-                continue
-            elapsed = now_ts - start
-            if not self._in_cleanup_intensive_window(elapsed):
-                continue
-            try:
-                open_orders = self.trader.get_open_orders()
-            except Exception:
-                open_orders = []
-            if self._one_side_filled_leg(
-                self._window_exposure(contract, open_orders)
-            ):
-                return True
-        return False
+        """True while flatten is active (pauses new limit placement)."""
+        return bool(self._cleanup_flatten_active)
 
     def _window_exposure(
         self, contract: ActiveContract, open_orders: list[dict[str, Any]]
@@ -508,15 +520,22 @@ class LimitPairEngine:
             f"DOWN:rest={exp.down_rest:g},pos={exp.down_pos:g}"
         )
 
-    def _one_side_filled_leg(self, exp: _WindowExposure) -> str | None:
-        """``UP`` or ``DOWN`` if exactly one leg has position; else ``None``."""
+    def _should_trigger_window_flatten(self, exp: _WindowExposure) -> bool:
+        """
+        Risk case at T+15: one leg has shares, the other still has a resting limit.
+        Example: UP position + DOWN 49¢ order still open.
+        """
         up_fill = exp.up_pos >= _POSITION_EPS
         down_fill = exp.down_pos >= _POSITION_EPS
-        if up_fill and not down_fill:
-            return "UP"
-        if down_fill and not up_fill:
-            return "DOWN"
-        return None
+        up_rest = exp.up_rest > 1e-6
+        down_rest = exp.down_rest > 1e-6
+        if up_fill and down_rest:
+            return True
+        if down_fill and up_rest:
+            return True
+        if (up_fill or down_fill) and (up_rest or down_rest):
+            return True
+        return False
 
     def _window_is_flat(self, contract: ActiveContract) -> tuple[bool, str]:
         """No open orders and no position on either UP/DOWN token."""
@@ -529,14 +548,17 @@ class LimitPairEngine:
         return True, self._exposure_detail(exp)
 
     def _finish_cleanup_monitoring(self, slug: str, *, reason: str) -> None:
-        """Stop T+15 cleanup polls for this slug without marking placement done."""
+        """Stop cleanup polls for this slug without marking placement done."""
         self._cleanup_done_slugs.add(slug)
         self._cleanup_armed_slugs.discard(slug)
+        self._cleanup_flatten_active.discard(slug)
         self._save_state()
         _out(f"CLEANUP_MONITOR_END slug={slug} {reason}")
 
     def _finish_window_cleanup(self, slug: str) -> None:
         self._cleanup_done_slugs.add(slug)
+        self._cleanup_flatten_active.discard(slug)
+        self._cleanup_armed_slugs.discard(slug)
         self._done_slugs.add(slug)
         self._submitted_legs.pop(slug, None)
         self._work_list = [j for j in self._work_list if j.contract.slug != slug]
@@ -545,7 +567,7 @@ class LimitPairEngine:
     def _run_cleanup_tick(
         self, slug: str, contract: ActiveContract, start_ts: int
     ) -> None:
-        """T+15…T+60: only act when exactly one leg of *this* window is filled."""
+        """T+15…T+60: on one-side risk, cancel ALL orders + sell ALL positions in window."""
         if self._wallet_blocked:
             return
 
@@ -557,111 +579,62 @@ class LimitPairEngine:
         open_orders = self._fetch_open_orders()
         exp = self._window_exposure(contract, open_orders)
         detail = self._exposure_detail(exp)
-        filled_leg = self._one_side_filled_leg(exp)
         intensive = self._in_cleanup_intensive_window(elapsed)
 
         if self.config.dry_run:
-            if slug not in self._cleanup_armed_slugs:
-                _out(f"CLEANUP_ARM dry_run slug={slug} t+{elapsed}s")
-                self._cleanup_armed_slugs.add(slug)
-            if filled_leg and elapsed >= self._cleanup_offset_sec:
+            if self._should_trigger_window_flatten(exp):
+                self._cleanup_flatten_active.add(slug)
+            if slug in self._cleanup_flatten_active and elapsed >= self._cleanup_offset_sec:
                 self._finish_window_cleanup(slug)
             elif elapsed >= self._cleanup_until_sec:
                 self._finish_cleanup_monitoring(slug, reason="dry_run")
             return
 
-        if slug not in self._cleanup_armed_slugs:
+        if slug not in self._cleanup_flatten_active:
+            if not self._should_trigger_window_flatten(exp):
+                if intensive:
+                    _out(f"CLEANUP_WATCH slug={slug} t+{elapsed}s no_risk_yet {detail}")
+                if elapsed >= self._cleanup_until_sec:
+                    self._finish_cleanup_monitoring(slug, reason="no_risk_by_t60")
+                return
+            self._cleanup_flatten_active.add(slug)
+            self._save_state()
             _out(
-                f"CLEANUP_ARM slug={slug} t+{elapsed}s "
-                f"one_side_only intensive=t+{self._cleanup_offset_sec}s.."
-                f"t+{self._cleanup_until_sec}s exit_sell={self._exit_sell_px:g}"
+                f"CLEANUP_TRIGGER slug={slug} t+{elapsed}s "
+                f"cancel_all+sell_all exit={self._exit_sell_px:g} {detail}"
             )
-            self._cleanup_armed_slugs.add(slug)
 
-        flat, _ = self._window_is_flat(contract)
-        if flat:
+        try:
+            result = self.trader.flatten_window_contract(
+                contract,
+                self._exit_sell_px,
+                max_sell_rounds=self._cleanup_sell_rounds,
+                position_eps=_POSITION_EPS,
+            )
+        except Exception as exc:
+            LOGGER.exception("CLEANUP_FLATTEN failed slug=%s t+%ss: %s", slug, elapsed, exc)
+            _out(f"CLEANUP_ERROR slug={slug} t+{elapsed}s {exc}")
+            return
+
+        _out(
+            f"CLEANUP_FLATTEN slug={slug} t+{elapsed}s/{self._cleanup_until_sec}s "
+            f"cancel={result.get('cancel_confirmed')}/{result.get('cancel_attempted')} "
+            f"up_rest={result.get('up_rest'):g} down_rest={result.get('down_rest'):g} "
+            f"up_pos={result.get('up_pos'):g} down_pos={result.get('down_pos'):g} "
+            f"sells={result.get('sells')} flat={result.get('flat')}"
+        )
+
+        if result.get("flat"):
             _out(f"CLEANUP_DONE slug={slug} t+{elapsed}s {detail}")
             self._finish_window_cleanup(slug)
             return
 
-        if filled_leg is None:
-            if intensive:
-                _out(
-                    f"CLEANUP_SKIP slug={slug} t+{elapsed}s "
-                    f"not_one_side_filled {detail}"
-                )
-            if elapsed >= self._cleanup_until_sec:
-                self._finish_cleanup_monitoring(
-                    slug,
-                    reason="no_one_side_fill_stop_poll",
-                )
-            return
-
-        # Exactly one leg filled in this window: cancel unfilled leg orders only, sell filled leg.
-        unfilled_token = contract.down if filled_leg == "UP" else contract.up
-        filled_token = contract.up if filled_leg == "UP" else contract.down
-        acted = False
-
-        confirmed, attempted = self.trader.cancel_token_orders_confirmed(
-            unfilled_token.token_id, open_orders=open_orders
-        )
-        if attempted:
-            acted = True
-            _out(
-                f"CLEANUP_CANCEL slug={slug} t+{elapsed}s "
-                f"cancel={unfilled_token.outcome}_only "
-                f"(filled={filled_leg}) confirmed={confirmed}/{attempted}"
-            )
-            open_orders = self._fetch_open_orders()
-
-        pos_before = self.trader.token_balance_allowance_refreshed(
-            filled_token.token_id
-        )
-        if pos_before >= _POSITION_EPS:
-            acted = True
-            try:
-                ok, pos_after = self.trader.flatten_conditional_at_price(
-                    filled_token,
-                    self._exit_sell_px,
-                    max_rounds=self._cleanup_sell_rounds,
-                    position_eps=_POSITION_EPS,
-                )
-                _out(
-                    f"CLEANUP_SELL slug={slug} t+{elapsed}s "
-                    f"sell={filled_token.outcome}_only "
-                    f"before={pos_before:g} after={pos_after:g} ok={ok}"
-                )
-            except Exception as exc:
-                LOGGER.error(
-                    "CLEANUP_SELL %s %s t+%ss: %s",
-                    slug,
-                    filled_token.outcome,
-                    elapsed,
-                    exc,
-                )
-
-        flat, detail = self._window_is_flat(contract)
-        if flat:
-            _out(
-                f"CLEANUP_DONE slug={slug} t+{elapsed}s one_side={filled_leg} {detail}"
-            )
-            self._finish_window_cleanup(slug)
-            return
-
         if intensive:
+            _out(f"CLEANUP_POLL slug={slug} t+{elapsed}s NOT_FLAT {detail}")
+        elif elapsed >= self._cleanup_until_sec:
             _out(
-                f"CLEANUP_POLL slug={slug} t+{elapsed}s/{self._cleanup_until_sec}s "
-                f"one_side={filled_leg} {detail}"
-            )
-        elif acted:
-            _out(
-                f"CLEANUP_POLL slug={slug} t+{elapsed}s (post-60s) "
-                f"one_side={filled_leg} {detail}"
-            )
-        else:
-            _out(
-                f"CLEANUP_STUCK slug={slug} t+{elapsed}s one_side={filled_leg} "
-                f"{detail} (1s poll until flat)"
+                f"CLEANUP_STUCK slug={slug} t+{elapsed}s past_t+{self._cleanup_until_sec}s "
+                f"{detail} (keep polling 1s until flat)"
             )
 
     def _run_due_window_cleanups(self) -> None:

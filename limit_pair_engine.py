@@ -6,7 +6,8 @@ Work list (closest window start first):
   - Every ``search_interval``: refresh target epochs, append new slots, re-sort.
   - Drop a slot once **both** UP and DOWN have resting limits and/or filled position.
   - Post a leg only when that token has **no** resting buy and **no** position.
-  - **T+15…T+60:** one-side risk (position + other leg still on book) → **cancel all** window orders + **sell all** positions @ 1¢ FAK, poll 1s until clear.
+  - **T+15…T+60:** if the window is not fully hedged with both legs filled, force-exit:
+    cancel all window orders + sell all window positions @ 1¢ FAK, poll 1s until clear.
   - Each ``order_spacing`` cycle: try the **top** slot only; on balance/placement
     error, keep it at the front and retry after ``order_spacing`` (funds may free up).
 """
@@ -309,9 +310,19 @@ class LimitPairEngine:
         self._sort_work_list()
 
     def _prune_contract_cache(self) -> None:
+        """Keep contracts long enough for T+15 cleanup; drop old finished windows only."""
+        now_ts = int(time.time())
         for slug in list(self._contract_cache):
-            if slug in self._done_slugs:
-                del self._contract_cache[slug]
+            start = self._window_start_by_slug.get(slug) or _slug_window_start(slug) or 0
+            if start <= 0:
+                continue
+            if slug in self._cleanup_flatten_active:
+                continue
+            if now_ts < (start + _WINDOW_SEC):
+                continue
+            if slug not in self._cleanup_done_slugs and slug not in self._done_slugs:
+                continue
+            del self._contract_cache[slug]
 
     def _fetch_open_orders(self, *, attempts: int = 3) -> list[dict[str, Any]]:
         last: list[dict[str, Any]] = []
@@ -434,7 +445,6 @@ class LimitPairEngine:
         self._done_slugs.add(slug)
         self._submitted_legs.pop(slug, None)
         self._save_state()
-        self._prune_contract_cache()
         self._work_list = [j for j in self._work_list if j.contract.slug != slug]
 
     def _window_start_for(self, slug: str, contract: ActiveContract) -> int:
@@ -520,22 +530,23 @@ class LimitPairEngine:
             f"DOWN:rest={exp.down_rest:g},pos={exp.down_pos:g}"
         )
 
+    def _window_has_any_exposure(self, exp: _WindowExposure) -> bool:
+        return (
+            exp.up_pos >= _POSITION_EPS
+            or exp.down_pos >= _POSITION_EPS
+            or exp.up_rest > 1e-6
+            or exp.down_rest > 1e-6
+        )
+
+    def _window_has_both_legs_filled(self, exp: _WindowExposure) -> bool:
+        return exp.up_pos >= _POSITION_EPS and exp.down_pos >= _POSITION_EPS
+
     def _should_trigger_window_flatten(self, exp: _WindowExposure) -> bool:
         """
-        Risk case at T+15: one leg has shares, the other still has a resting limit.
-        Example: UP position + DOWN 49¢ order still open.
+        At T+15 and later, flatten any window that still has exposure but is not fully
+        hedged with both UP and DOWN positions filled.
         """
-        up_fill = exp.up_pos >= _POSITION_EPS
-        down_fill = exp.down_pos >= _POSITION_EPS
-        up_rest = exp.up_rest > 1e-6
-        down_rest = exp.down_rest > 1e-6
-        if up_fill and down_rest:
-            return True
-        if down_fill and up_rest:
-            return True
-        if (up_fill or down_fill) and (up_rest or down_rest):
-            return True
-        return False
+        return self._window_has_any_exposure(exp) and not self._window_has_both_legs_filled(exp)
 
     def _window_is_flat(self, contract: ActiveContract) -> tuple[bool, str]:
         """No open orders and no position on either UP/DOWN token."""
@@ -591,11 +602,19 @@ class LimitPairEngine:
             return
 
         if slug not in self._cleanup_flatten_active:
-            if not self._should_trigger_window_flatten(exp):
+            if not self._window_has_any_exposure(exp):
                 if intensive:
-                    _out(f"CLEANUP_WATCH slug={slug} t+{elapsed}s no_risk_yet {detail}")
+                    _out(f"CLEANUP_WATCH slug={slug} t+{elapsed}s flat {detail}")
                 if elapsed >= self._cleanup_until_sec:
-                    self._finish_cleanup_monitoring(slug, reason="no_risk_by_t60")
+                    self._finish_cleanup_monitoring(slug, reason="flat_by_t60")
+                return
+            if self._window_has_both_legs_filled(exp):
+                if intensive:
+                    _out(f"CLEANUP_WATCH slug={slug} t+{elapsed}s both_legs_filled {detail}")
+                if elapsed >= self._cleanup_until_sec:
+                    self._finish_cleanup_monitoring(slug, reason="both_legs_filled")
+                return
+            if not self._should_trigger_window_flatten(exp):
                 return
             self._cleanup_flatten_active.add(slug)
             self._save_state()
@@ -625,7 +644,11 @@ class LimitPairEngine:
         )
 
         if result.get("flat"):
-            _out(f"CLEANUP_DONE slug={slug} t+{elapsed}s {detail}")
+            _out(
+                f"CLEANUP_DONE slug={slug} t+{elapsed}s "
+                f"UP:rest={result.get('up_rest'):g},pos={result.get('up_pos'):g} "
+                f"DOWN:rest={result.get('down_rest'):g},pos={result.get('down_pos'):g}"
+            )
             self._finish_window_cleanup(slug)
             return
 
@@ -644,6 +667,7 @@ class LimitPairEngine:
                 self._run_cleanup_tick(slug, contract, start_ts)
             except Exception:
                 LOGGER.exception("window cleanup failed slug=%s", slug)
+        self._prune_contract_cache()
 
     def _main_loop_sleep_sec(self) -> float:
         now_ts = int(time.time())

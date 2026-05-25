@@ -166,6 +166,8 @@ class LimitPairEngine:
         self._wallet_blocked = False
         self._idle_log_interval = 60.0
         self._last_idle_log_monotonic = 0.0
+        # Skip first N windows only on the first SEARCH after process start; later cycles use full horizon.
+        self._startup_skip_pending = self._skip_first_windows > 0
         self._load_state()
 
     def _load_state(self) -> None:
@@ -241,14 +243,14 @@ class LimitPairEngine:
             ).strftime("%H:%M")
             span = f" block={t0}-{t1}Z"
         sym_s = ",".join(self._symbols)
-        per_sym = max(0, len(starts) - self._skip_first_windows)
-        slots = per_sym * len(self._symbols)
+        per_sym_first = max(0, len(starts) - self._skip_first_windows)
+        slots = per_sym_first * len(self._symbols)
         _out(
             "INIT "
             f"strategy=limit_pair_5m symbols={sym_s} "
             f"up={self._up_px:g} down={self._down_px:g} shares={self._shares} "
-            f"horizon_min={self._horizon_minutes} skip_first={self._skip_first_windows} "
-            f"slots≈{slots}{span} "
+            f"horizon_min={self._horizon_minutes} skip_first_at_startup={self._skip_first_windows} "
+            f"slots_first_search≈{slots}{span} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
             f"state={self._state_path} done={len(self._done_slugs)} queue={len(self._work_list)} "
             f"dry_run={self.config.dry_run} "
@@ -392,12 +394,15 @@ class LimitPairEngine:
                 _out(f"DONE slug={slug} up={self._up_px:g} down={self._down_px:g}")
 
     def _search_windows(self) -> None:
-        """Rebuild queue: future 5m windows in horizon, skip first N per symbol, minus done."""
+        """Rebuild queue: future 5m windows in horizon, minus done."""
         now_ts = int(time.time())
         future_starts = plan_future_window_starts(
             now_ts, horizon_minutes=self._horizon_minutes
         )
-        active_starts = future_starts[self._skip_first_windows :]
+        skip_n = self._skip_first_windows if self._startup_skip_pending else 0
+        active_starts = future_starts[skip_n:]
+        if self._startup_skip_pending:
+            self._startup_skip_pending = False
 
         new_queue: list[_WindowJob] = []
         resolved = 0
@@ -447,7 +452,7 @@ class LimitPairEngine:
         if cleared:
             cleared_s = f" cleared_submitted={cleared}"
         _out(
-            f"SEARCH horizon_min={self._horizon_minutes} skip={self._skip_first_windows} "
+            f"SEARCH horizon_min={self._horizon_minutes} skip={skip_n} "
             f"epochs={len(future_starts)} active={len(active_starts)} "
             f"resolved={resolved} gamma_miss={gamma_miss} "
             f"queue={len(self._work_list)} done={len(self._done_slugs)}{cleared_s}{top}"

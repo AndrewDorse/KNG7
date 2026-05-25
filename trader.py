@@ -13,23 +13,29 @@ from typing import Any
 
 import requests
 
+_FORCE_CLOB_V1 = os.getenv("BOT_CLOB_USE_V1", "").strip().lower() in ("1", "true", "yes")
+
 _CLOB_V2 = False
-try:
-    from py_clob_client_v2 import (
-        ApiCreds,
-        AssetType,
-        BalanceAllowanceParams,
-        ClobClient,
-        MarketOrderArgs,
-        OpenOrderParams,
-        OrderArgs,
-        OrderPayload,
-        OrderType,
-        PartialCreateOrderOptions,
-        Side,
-    )
-    _CLOB_V2 = True
-except Exception:
+if not _FORCE_CLOB_V1:
+    try:
+        from py_clob_client_v2 import (
+            ApiCreds,
+            AssetType,
+            BalanceAllowanceParams,
+            ClobClient,
+            MarketOrderArgs,
+            OpenOrderParams,
+            OrderArgs,
+            OrderPayload,
+            OrderType,
+            PartialCreateOrderOptions,
+            Side,
+        )
+        _CLOB_V2 = True
+    except Exception:
+        pass
+
+if not _CLOB_V2:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
         ApiCreds,
@@ -80,17 +86,18 @@ def wallet_config_hint_for_error(exc: BaseException) -> str:
     lines = [
         "",
         "Wallet / CLOB setup checklist:",
-        "  1. POLY_FUNDER = the address shown on polymarket.com (Profile / Deposit),",
-        "     NOT your MetaMask EOA unless you trade as a raw EOA (rare on CLOB v2).",
-        "  2. POLY_PRIVATE_KEY = private key that controls / signed up that Polymarket account.",
-        "  3. POLY_SIGNATURE_TYPE:",
-        "       1 = email/Magic Polymarket login (proxy wallet)",
-        "       2 = browser wallet + Polymarket Safe/proxy (MetaMask etc.)",
-        "       0 = raw EOA (often rejected: 'use deposit wallet flow' on CLOB v2)",
-        "       3 = new deposit-wallet flow (POLY_1271; requires py_clob_client_v2 support)",
-        "  4. If derive-api-key fails: set RELAYER_API_KEY (+ SECRET + PASSPHRASE from Polymarket),",
-        "     or fix signature_type + funder so create_or_derive_api_creds succeeds.",
-        "  5. Run: python check_wallet.py",
+        "  A) Polymarket migrated many accounts to CLOB v2 'deposit wallet' (May 2026).",
+        "     Symptom: maker address not allowed + derive-api-key 400, even with correct funder.",
+        "     Magic/email accounts: signature_type=1 often FAILS on py_clob_client_v2 (GitHub #56).",
+        "  B) Try in order:",
+        "     1. BOT_CLOB_USE_V1=true  (legacy py-clob-client — same as old kng_bot3 bot)",
+        "     2. POLY_SIGNATURE_TYPE=3  + funder = proxyAddress from polymarket.com/profile HTML",
+        "        (View Source → search proxyAddress; NOT always the UI 'deposit' label)",
+        "     3. Clear RELAYER_* env vars — use create_or_derive_api_key from POLY_PRIVATE_KEY",
+        "        (dashboard 'imported API' keys often mismatch the signer)",
+        "     4. Place one small order on polymarket.com UI first (deploys proxy bytecode)",
+        "  C) POLY_PRIVATE_KEY = exported Magic/browser key; POLY_FUNDER = profile proxy wallet.",
+        "  D. Run: python check_wallet.py",
     ]
     if is_deposit_wallet_flow_error(exc):
         lines.insert(
@@ -100,6 +107,62 @@ def wallet_config_hint_for_error(exc: BaseException) -> str:
     if is_api_key_derive_error(exc):
         lines.insert(1, ">>> API key derive failed — check private key + funder + RELAYER_* creds.")
     return "\n".join(lines)
+
+
+def funder_has_contract_code(funder: str) -> bool | None:
+    """True if POLY_FUNDER is a deployed contract (V2 deposit-wallet proxy)."""
+    try:
+        resp = requests.post(
+            "https://polygon-rpc.com",
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_getCode",
+                "params": [funder, "latest"],
+                "id": 1,
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        code = str(resp.json().get("result") or "0x")
+        return len(code) > 2
+    except Exception:
+        return None
+
+
+def diagnose_clob_wallet(config: BotConfig) -> list[str]:
+    """Non-fatal hints based on on-chain funder type and client version."""
+    notes: list[str] = []
+    if _FORCE_CLOB_V1:
+        notes.append("CLOB client: py-clob-client v1 (BOT_CLOB_USE_V1=true)")
+    elif _CLOB_V2:
+        notes.append("CLOB client: py_clob_client_v2 (Polymarket CLOB v2 API)")
+    else:
+        notes.append("CLOB client: py-clob-client v1 (v2 not installed)")
+
+    if config.relayer_api_key:
+        notes.append(
+            "RELAYER_API_KEY is set — if orders fail, try clearing RELAYER_* and "
+            "let the bot derive API creds from POLY_PRIVATE_KEY (dashboard keys often mismatch)."
+        )
+
+    is_contract = funder_has_contract_code(config.funder)
+    if is_contract is True and config.signature_type in (0, 1, 2):
+        notes.append(
+            "POLY_FUNDER is a deployed smart-contract proxy on Polygon — Polymarket likely "
+            "migrated this account to the V2 deposit-wallet flow. "
+            "Set POLY_SIGNATURE_TYPE=3 (or BOT_CLOB_USE_V1=true to try legacy client)."
+        )
+    if is_contract is False and config.signature_type == 3:
+        notes.append(
+            "POLY_FUNDER looks like an EOA but POLY_SIGNATURE_TYPE=3 — "
+            "use proxyAddress from polymarket.com/profile as funder."
+        )
+    if _CLOB_V2 and config.signature_type == 1:
+        notes.append(
+            "Magic/proxy (signature_type=1) + py_clob_client_v2 is a known broken combo "
+            "(Polymarket/py-clob-client-v2#56). Try BOT_CLOB_USE_V1=true first."
+        )
+    return notes
 
 
 def _normalized_tick_size(raw: str | None) -> str | None:
@@ -375,6 +438,8 @@ class PolymarketTrader:
             "balance_usdc": bal,
             "relayer_api_key": bool(self.config.relayer_api_key),
             "clob_v2": _CLOB_V2,
+            "clob_v1_forced": _FORCE_CLOB_V1,
+            "funder_is_contract": funder_has_contract_code(self.config.funder),
         }
 
     def validate_wallet_config(self) -> tuple[bool, str]:
@@ -394,12 +459,33 @@ class PolymarketTrader:
                 f"{sig} (proxy/Safe). Set POLY_FUNDER to your Polymarket profile "
                 "deposit address (polymarket.com → Profile / Deposit), not MetaMask EOA.",
             )
-        if sig == 0:
+        if sig == 0 and _CLOB_V2 and not _FORCE_CLOB_V1:
             return (
                 False,
-                "POLY_SIGNATURE_TYPE=0 (raw EOA) is often rejected on CLOB v2 "
-                "('deposit wallet flow'). Use type 1 (email login) or 2 (browser wallet) "
-                "with POLY_FUNDER = Polymarket deposit address.",
+                "POLY_SIGNATURE_TYPE=0 (raw EOA) is rejected on CLOB v2 for most accounts. "
+                "Try BOT_CLOB_USE_V1=true, or POLY_SIGNATURE_TYPE=3 with profile proxyAddress.",
+            )
+        if (
+            summary.get("funder_is_contract") is True
+            and sig in (0, 1, 2)
+            and _CLOB_V2
+            and not _FORCE_CLOB_V1
+        ):
+            return (
+                False,
+                "Account uses a V2 deposit-wallet proxy (contract at POLY_FUNDER) but "
+                f"POLY_SIGNATURE_TYPE={sig}. Set POLY_SIGNATURE_TYPE=3 or BOT_CLOB_USE_V1=true.",
+            )
+        if (
+            _CLOB_V2
+            and not _FORCE_CLOB_V1
+            and sig == 1
+            and summary.get("balance_usdc", 0) <= 0
+        ):
+            return (
+                False,
+                "Magic/proxy wallet (type 1) + CLOB v2 client: balance reads $0 and orders "
+                "are often rejected. Try BOT_CLOB_USE_V1=true (legacy client like old bot).",
             )
         if summary.get("balance_usdc", 0) <= 0:
             return (

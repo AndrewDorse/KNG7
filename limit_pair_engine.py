@@ -51,10 +51,30 @@ def plan_window_starts(
     window_count: int,
     window_sec: int = _WINDOW_SEC,
 ) -> list[int]:
+    """Legacy fixed-count planner (lead + N windows)."""
     anchor = int(now_ts) + int(lead_minutes) * 60
     first = _ceil_to_window(anchor, window_sec)
     n = max(0, int(window_count))
     return [first + i * window_sec for i in range(n)]
+
+
+def plan_future_window_starts(
+    now_ts: int,
+    *,
+    horizon_minutes: int,
+    window_sec: int = _WINDOW_SEC,
+) -> list[int]:
+    """5m epoch starts strictly in the future within ``now + horizon_minutes``."""
+    horizon_sec = max(1, int(horizon_minutes)) * 60
+    end_ts = int(now_ts) + horizon_sec
+    first = _ceil_to_window(int(now_ts) + 1, window_sec)
+    out: list[int] = []
+    t = first
+    while t <= end_ts:
+        if t > int(now_ts):
+            out.append(t)
+        t += window_sec
+    return out
 
 
 def _path_writable(path: Path) -> bool:
@@ -127,8 +147,8 @@ class LimitPairEngine:
         lp = config
         self._symbols = lp.limit_pair_symbols
         self._sym_rank = {s: i for i, s in enumerate(self._symbols)}
-        self._lead_minutes = lp.limit_pair_lead_minutes
-        self._window_count = lp.limit_pair_window_count
+        self._horizon_minutes = lp.limit_pair_next_windows_search_minutes
+        self._skip_first_windows = lp.limit_pair_skip_first_windows
         self._search_interval = lp.limit_pair_search_interval_seconds
         self._order_spacing = lp.limit_pair_order_spacing_seconds
         self._up_px = lp.limit_pair_up_px
@@ -144,6 +164,8 @@ class LimitPairEngine:
         self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
         self._wallet_blocked = False
+        self._idle_log_interval = 60.0
+        self._last_idle_log_monotonic = 0.0
         self._load_state()
 
     def _load_state(self) -> None:
@@ -208,15 +230,9 @@ class LimitPairEngine:
     def _sort_work_list(self) -> None:
         self._work_list.sort(key=self._job_sort_key)
 
-    def _slug_in_work_list(self, slug: str) -> bool:
-        return any(j.contract.slug == slug for j in self._work_list)
-
     def _emit_init(self) -> None:
-        starts = plan_window_starts(
-            int(time.time()),
-            lead_minutes=self._lead_minutes,
-            window_count=self._window_count,
-        )
+        now_ts = int(time.time())
+        starts = plan_future_window_starts(now_ts, horizon_minutes=self._horizon_minutes)
         span = ""
         if starts:
             t0 = datetime.fromtimestamp(starts[0], tz=timezone.utc).strftime("%H:%M")
@@ -225,13 +241,14 @@ class LimitPairEngine:
             ).strftime("%H:%M")
             span = f" block={t0}-{t1}Z"
         sym_s = ",".join(self._symbols)
-        slots = len(starts) * len(self._symbols)
+        per_sym = max(0, len(starts) - self._skip_first_windows)
+        slots = per_sym * len(self._symbols)
         _out(
             "INIT "
             f"strategy=limit_pair_5m symbols={sym_s} "
             f"up={self._up_px:g} down={self._down_px:g} shares={self._shares} "
-            f"lead_min={self._lead_minutes} windows={self._window_count} "
-            f"slots={slots}{span} "
+            f"horizon_min={self._horizon_minutes} skip_first={self._skip_first_windows} "
+            f"slots≈{slots}{span} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
             f"state={self._state_path} done={len(self._done_slugs)} queue={len(self._work_list)} "
             f"dry_run={self.config.dry_run} "
@@ -269,7 +286,19 @@ class LimitPairEngine:
         self._submitted_legs.setdefault(slug, set()).add(leg.strip().upper())
         self._save_state()
 
-    def _leg_satisfied(
+    def _leg_resting_shares(
+        self, token_id: str, price: float, open_orders: list[dict[str, Any]]
+    ) -> float:
+        return self.trader.resting_buy_shares_near(
+            token_id, price, tol=self._price_tol, open_orders=open_orders
+        )
+
+    def _leg_on_book(
+        self, token_id: str, price: float, open_orders: list[dict[str, Any]]
+    ) -> bool:
+        return self._leg_resting_shares(token_id, price, open_orders) >= float(self._shares) - 1e-6
+
+    def _leg_should_skip_post(
         self,
         slug: str,
         leg: str,
@@ -279,32 +308,24 @@ class LimitPairEngine:
     ) -> bool:
         """True when we should NOT post another limit for this leg."""
         leg_u = leg.strip().upper()
-        resting = self.trader.resting_buy_shares_near(
-            token_id, price, tol=self._price_tol, open_orders=open_orders
-        )
+        resting = self._leg_resting_shares(token_id, price, open_orders)
         if resting >= float(self._shares) - 1e-6:
             return True
         submitted = self._submitted_legs.get(slug, set())
-        if leg_u in submitted and resting > 1e-6:
-            return True
-        if leg_u in submitted and resting <= 1e-6:
-            # POST accepted earlier; book may lag — do not stack duplicate orders.
+        if leg_u in submitted:
+            # POST accepted; book may lag — do not stack duplicate orders.
             return True
         return False
 
-    def _up_satisfied(
+    def _up_on_book(
         self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
     ) -> bool:
-        return self._leg_satisfied(
-            slug, "UP", contract.up.token_id, self._up_px, open_orders
-        )
+        return self._leg_on_book(contract.up.token_id, self._up_px, open_orders)
 
-    def _down_satisfied(
+    def _down_on_book(
         self, slug: str, contract: ActiveContract, open_orders: list[dict[str, Any]]
     ) -> bool:
-        return self._leg_satisfied(
-            slug, "DOWN", contract.down.token_id, self._down_px, open_orders
-        )
+        return self._leg_on_book(contract.down.token_id, self._down_px, open_orders)
 
     def _pair_complete(
         self,
@@ -314,7 +335,7 @@ class LimitPairEngine:
     ) -> bool:
         if self.config.dry_run:
             return slug in self._done_slugs
-        return self._up_satisfied(slug, contract, open_orders) and self._down_satisfied(
+        return self._up_on_book(slug, contract, open_orders) and self._down_on_book(
             slug, contract, open_orders
         )
 
@@ -371,55 +392,81 @@ class LimitPairEngine:
                 _out(f"DONE slug={slug} up={self._up_px:g} down={self._down_px:g}")
 
     def _search_windows(self) -> None:
+        """Rebuild queue: future 5m windows in horizon, skip first N per symbol, minus done."""
         now_ts = int(time.time())
-        targets = plan_window_starts(
-            now_ts,
-            lead_minutes=self._lead_minutes,
-            window_count=self._window_count,
+        future_starts = plan_future_window_starts(
+            now_ts, horizon_minutes=self._horizon_minutes
         )
-        added = 0
-        found = 0
+        active_starts = future_starts[self._skip_first_windows :]
 
-        for start_ts in targets:
-            if start_ts + _WINDOW_SEC <= now_ts:
-                continue
-            for symbol in self._symbols:
+        new_queue: list[_WindowJob] = []
+        resolved = 0
+        gamma_miss = 0
+
+        for symbol in self._symbols:
+            for start_ts in active_starts:
                 contract = self.locator.get_contract_for_window_start(
                     _WINDOW_MINUTES,
                     start_ts,
                     market_symbol=symbol,
                 )
                 if contract is None:
+                    gamma_miss += 1
                     continue
                 slug = contract.slug
-                found += 1
+                resolved += 1
                 self._contract_cache[slug] = contract
                 if slug in self._done_slugs:
                     continue
-                if self._slug_in_work_list(slug):
-                    continue
-                self._work_list.append(
+                new_queue.append(
                     _WindowJob(symbol=symbol, start_ts=start_ts, contract=contract)
                 )
-                added += 1
 
+        self._work_list = new_queue
         self._sort_work_list()
         self._prune_work_list()
 
-        target_slots = len(targets) * len(self._symbols)
-        if found or added:
-            top = ""
-            if self._work_list:
-                j = self._work_list[0]
-                top = (
-                    f" next={j.contract.slug} "
-                    f"@{datetime.fromtimestamp(j.start_ts, tz=timezone.utc).strftime('%H:%M')}Z"
-                )
-            _out(
-                f"SEARCH epochs={len(targets)} slots={target_slots} "
-                f"resolved={found} added={added} queue={len(self._work_list)}{top}"
+        # Re-queued slots get a fresh post attempt each SEARCH (easier restart / recovery).
+        queued_slugs = {j.contract.slug for j in self._work_list}
+        cleared = 0
+        for slug in list(self._submitted_legs):
+            if slug in queued_slugs and slug not in self._done_slugs:
+                del self._submitted_legs[slug]
+                cleared += 1
+        if cleared:
+            self._save_state()
+
+        top = ""
+        if self._work_list:
+            j = self._work_list[0]
+            top = (
+                f" next={j.contract.slug} "
+                f"@{datetime.fromtimestamp(j.start_ts, tz=timezone.utc).strftime('%H:%M')}Z"
             )
+        cleared_s = ""
+        if cleared:
+            cleared_s = f" cleared_submitted={cleared}"
+        _out(
+            f"SEARCH horizon_min={self._horizon_minutes} skip={self._skip_first_windows} "
+            f"epochs={len(future_starts)} active={len(active_starts)} "
+            f"resolved={resolved} gamma_miss={gamma_miss} "
+            f"queue={len(self._work_list)} done={len(self._done_slugs)}{cleared_s}{top}"
+        )
         self.trader.sync_ws_subscriptions(list(self._contract_cache.values()))
+
+    def _maybe_log_idle(self) -> None:
+        now_mono = time.monotonic()
+        if (now_mono - self._last_idle_log_monotonic) < self._idle_log_interval:
+            return
+        self._last_idle_log_monotonic = now_mono
+        if self._wallet_blocked:
+            _out("IDLE wallet_blocked=true — fix .env and restart")
+            return
+        if not self._work_list:
+            _out(
+                f"IDLE queue=0 done={len(self._done_slugs)} "
+                f"horizon_min={self._horizon_minutes} (waiting for SEARCH)"
+            )
 
     def _place_window_pair(self, job: _WindowJob) -> _PlaceStatus:
         contract = job.contract
@@ -450,7 +497,9 @@ class LimitPairEngine:
         had_error = False
         balance_blocked = False
 
-        if not self._up_satisfied(slug, contract, open_orders):
+        if not self._leg_should_skip_post(
+            slug, "UP", contract.up.token_id, self._up_px, open_orders
+        ):
             try:
                 self.trader.place_limit_buy(contract.up, self._up_px, self._shares)
                 self._note_submitted(slug, "UP")
@@ -470,7 +519,9 @@ class LimitPairEngine:
                     self._shares,
                     exc,
                 )
-        if not self._down_satisfied(slug, contract, open_orders):
+        if not self._leg_should_skip_post(
+            slug, "DOWN", contract.down.token_id, self._down_px, open_orders
+        ):
             try:
                 self.trader.place_limit_buy(contract.down, self._down_px, self._shares)
                 self._note_submitted(slug, "DOWN")
@@ -553,6 +604,7 @@ class LimitPairEngine:
                     self._last_search_monotonic = now_mono
 
                 self._reconcile_done_from_clob()
+                self._maybe_log_idle()
 
                 if self._work_list:
                     status = self._process_top_job()

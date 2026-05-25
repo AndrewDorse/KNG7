@@ -344,6 +344,9 @@ class BotConfig:
     limit_pair_shares: int = 10
     limit_pair_lead_minutes: int = 15
     limit_pair_window_count: int = 24
+    # Rolling horizon: every search cycle queues not-yet-started 5m windows in the next N minutes.
+    limit_pair_next_windows_search_minutes: int = 60
+    limit_pair_skip_first_windows: int = 3
     limit_pair_search_interval_seconds: float = 300.0
     limit_pair_order_spacing_seconds: float = 10.0
     limit_pair_state_path: str = "exports/limit_pair_state.json"
@@ -429,6 +432,24 @@ class BotConfig:
             )
         except ValueError as exc:
             raise BotConfigError("BOT_LIMIT_PAIR_SHARES must be an int") from exc
+        next_windows_raw = (
+            os.getenv("NEXT_WINDOWS_SEARCH_MINUTES")
+            or os.getenv("BOT_NEXT_WINDOWS_SEARCH_MINUTES")
+            or os.getenv("BOT_LIMIT_PAIR_NEXT_WINDOWS_SEARCH_MINUTES")
+        )
+        try:
+            limit_pair_next_windows_search_minutes = max(
+                5,
+                int(next_windows_raw) if next_windows_raw not in (None, "") else 60,
+            )
+        except ValueError as exc:
+            raise BotConfigError(
+                "NEXT_WINDOWS_SEARCH_MINUTES must be an integer (minutes)"
+            ) from exc
+        limit_pair_skip_first_windows = max(
+            0,
+            _env_int("BOT_LIMIT_PAIR_SKIP_FIRST_WINDOWS", 3),
+        )
         limit_pair_hours_raw = os.getenv("BOT_LIMIT_PAIR_HOURS")
         if limit_pair_hours_raw not in (None, ""):
             try:
@@ -719,6 +740,8 @@ class BotConfig:
             limit_pair_shares=limit_pair_shares,
             limit_pair_lead_minutes=max(0, _env_int("BOT_LIMIT_PAIR_LEAD_MINUTES", 15)),
             limit_pair_window_count=limit_pair_window_count,
+            limit_pair_next_windows_search_minutes=limit_pair_next_windows_search_minutes,
+            limit_pair_skip_first_windows=limit_pair_skip_first_windows,
             limit_pair_search_interval_seconds=max(
                 30.0, _env_float("BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC", 300.0)
             ),

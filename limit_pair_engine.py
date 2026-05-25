@@ -113,6 +113,13 @@ def _resolve_state_path(configured: str) -> Path:
     return candidates[0]
 
 
+def _slug_window_start(slug: str) -> int | None:
+    try:
+        return int(str(slug).rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_balance_or_funds_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     needles = (
@@ -164,6 +171,11 @@ class LimitPairEngine:
         # Legs we already POSTed (survives restarts) — prevents duplicate limits on retry.
         self._submitted_legs: dict[str, set[str]] = {}
         self._contract_cache: dict[str, ActiveContract] = {}
+        self._window_start_by_slug: dict[str, int] = {}
+        self._cleanup_done_slugs: set[str] = set()
+        self._cleanup_offset_sec = lp.limit_pair_window_cleanup_offset_sec
+        self._exit_sell_px = lp.limit_pair_exit_sell_price
+        self._cleanup_verify_rounds = lp.limit_pair_cleanup_verify_rounds
         self._work_list: list[_WindowJob] = []
         self._last_search_monotonic = 0.0
         self._wallet_blocked = False
@@ -192,6 +204,8 @@ class LimitPairEngine:
                     self._submitted_legs[str(slug)] = {
                         str(x).strip().upper() for x in legs if str(x).strip()
                     }
+        cleaned = raw.get("cleanup_done_slugs") or []
+        self._cleanup_done_slugs = {str(s) for s in cleaned}
 
     def _save_state(self) -> None:
         payload = {
@@ -200,6 +214,7 @@ class LimitPairEngine:
             "submitted_legs": {
                 slug: sorted(legs) for slug, legs in sorted(self._submitted_legs.items())
             },
+            "cleanup_done_slugs": sorted(self._cleanup_done_slugs),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         body = json.dumps(payload, indent=2)
@@ -254,6 +269,7 @@ class LimitPairEngine:
             f"up={self._up_px:g} down={self._down_px:g} shares={self._shares} "
             f"horizon_min={self._horizon_minutes} skip_first_at_startup={self._skip_first_windows} "
             f"slots_first_search≈{slots}{span} "
+            f"cleanup_t+{self._cleanup_offset_sec}s exit_px={self._exit_sell_px:g} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
             f"state={self._state_path} done={len(self._done_slugs)} queue={len(self._work_list)} "
             f"dry_run={self.config.dry_run} "
@@ -402,6 +418,163 @@ class LimitPairEngine:
         self._prune_contract_cache()
         self._work_list = [j for j in self._work_list if j.contract.slug != slug]
 
+    def _window_start_for(self, slug: str, contract: ActiveContract) -> int:
+        return (
+            self._window_start_by_slug.get(slug)
+            or _slug_window_start(slug)
+            or 0
+        )
+
+    def _contracts_due_cleanup(
+        self, now_ts: int
+    ) -> list[tuple[str, ActiveContract, int]]:
+        due: list[tuple[str, ActiveContract, int]] = []
+        for slug, contract in list(self._contract_cache.items()):
+            if slug in self._cleanup_done_slugs:
+                continue
+            start = self._window_start_for(slug, contract)
+            if start <= 0:
+                continue
+            trigger = start + self._cleanup_offset_sec
+            if trigger <= now_ts < start + _WINDOW_SEC:
+                due.append((slug, contract, start))
+        due.sort(key=lambda x: x[2])
+        return due
+
+    def _window_is_flat(self, contract: ActiveContract) -> tuple[bool, str]:
+        """No open orders and no position on either UP/DOWN token."""
+        open_orders = self._fetch_open_orders()
+        parts: list[str] = []
+        for leg, token in (("UP", contract.up), ("DOWN", contract.down)):
+            rest = self.trader.resting_order_shares_on_token(
+                token.token_id, open_orders=open_orders
+            )
+            pos = self._leg_position_shares(token.token_id)
+            parts.append(f"{leg}:rest={rest:g},pos={pos:g}")
+            if rest > 1e-6 or pos >= _POSITION_EPS:
+                return False, " ".join(parts)
+        return True, " ".join(parts)
+
+    def _finish_window_cleanup(self, slug: str) -> None:
+        self._cleanup_done_slugs.add(slug)
+        self._done_slugs.add(slug)
+        self._submitted_legs.pop(slug, None)
+        self._work_list = [j for j in self._work_list if j.contract.slug != slug]
+        self._save_state()
+
+    def _run_single_window_cleanup(
+        self, slug: str, contract: ActiveContract, start_ts: int
+    ) -> None:
+        """T+offset: cancel all window orders, market-sell positions, verify flat."""
+        if self._wallet_blocked:
+            return
+
+        elapsed = int(time.time()) - start_ts
+        if self.config.dry_run:
+            _out(f"CLEANUP_T15 dry_run slug={slug} t+{elapsed}s")
+            self._finish_window_cleanup(slug)
+            return
+
+        _out(
+            f"CLEANUP_T15 slug={slug} t+{elapsed}s "
+            f"(offset={self._cleanup_offset_sec}s left={start_ts + _WINDOW_SEC - int(time.time())}s)"
+        )
+
+        open_orders = self._fetch_open_orders()
+        up_id = contract.up.token_id
+        down_id = contract.down.token_id
+        up_rest_buy = self.trader.resting_buy_shares_on_token(up_id, open_orders)
+        down_rest_buy = self.trader.resting_buy_shares_on_token(down_id, open_orders)
+        up_pos = self._leg_position_shares(up_id)
+        down_pos = self._leg_position_shares(down_id)
+
+        if (
+            up_rest_buy <= 1e-6
+            and down_rest_buy <= 1e-6
+            and up_pos < _POSITION_EPS
+            and down_pos < _POSITION_EPS
+        ):
+            flat, detail = self._window_is_flat(contract)
+            _out(f"CLEANUP_SKIP slug={slug} already flat {detail}")
+            self._finish_window_cleanup(slug)
+            return
+
+        # --- Cancel all resting orders on both tokens (confirm each cancel) ---
+        for token in (contract.up, contract.down):
+            confirmed, attempted = self.trader.cancel_token_orders_confirmed(
+                token.token_id, open_orders=open_orders
+            )
+            _out(
+                f"CLEANUP_CANCEL slug={slug} {token.outcome} "
+                f"confirmed={confirmed}/{attempted}"
+            )
+            open_orders = self._fetch_open_orders()
+
+        # --- Market-sell any held shares at exit_px (typically one leg filled) ---
+        for token in (contract.up, contract.down):
+            pos = self._leg_position_shares(token.token_id)
+            if pos < _POSITION_EPS:
+                continue
+            try:
+                self.trader.place_marketable_sell(token, self._exit_sell_px, pos)
+                _out(
+                    f"CLEANUP_SELL slug={slug} {token.outcome} "
+                    f"px={self._exit_sell_px:g} shares={pos:g}"
+                )
+            except Exception as exc:
+                LOGGER.error(
+                    "CLEANUP_SELL %s %s failed: %s", slug, token.outcome, exc
+                )
+
+        # --- Verify flat; retry cancel/sell on stragglers ---
+        flat = False
+        detail = ""
+        for round_i in range(self._cleanup_verify_rounds):
+            time.sleep(0.5)
+            flat, detail = self._window_is_flat(contract)
+            if flat:
+                _out(f"CLEANUP_VERIFY slug={slug} ok round={round_i + 1} {detail}")
+                break
+            open_orders = self._fetch_open_orders()
+            for token in (contract.up, contract.down):
+                self.trader.cancel_token_orders_confirmed(
+                    token.token_id, open_orders=open_orders
+                )
+                open_orders = self._fetch_open_orders()
+                pos = self._leg_position_shares(token.token_id)
+                if pos >= _POSITION_EPS:
+                    try:
+                        self.trader.place_marketable_sell(
+                            token, self._exit_sell_px, pos
+                        )
+                        _out(
+                            f"CLEANUP_SELL_RETRY slug={slug} {token.outcome} "
+                            f"shares={pos:g}"
+                        )
+                    except Exception as exc:
+                        LOGGER.error(
+                            "CLEANUP_SELL_RETRY %s %s: %s",
+                            slug,
+                            token.outcome,
+                            exc,
+                        )
+            _out(
+                f"CLEANUP_VERIFY slug={slug} pending round={round_i + 1} {detail}"
+            )
+
+        if flat:
+            self._finish_window_cleanup(slug)
+        else:
+            _out(f"CLEANUP_INCOMPLETE slug={slug} {detail} (will retry)")
+
+    def _run_due_window_cleanups(self) -> None:
+        now_ts = int(time.time())
+        for slug, contract, start_ts in self._contracts_due_cleanup(now_ts):
+            try:
+                self._run_single_window_cleanup(slug, contract, start_ts)
+            except Exception:
+                LOGGER.exception("window cleanup failed slug=%s", slug)
+
     def _reconcile_done_from_clob(self) -> None:
         """Promote work-list slots that already have both limits resting (e.g. after restart)."""
         if self.config.dry_run or not self._work_list:
@@ -451,6 +624,7 @@ class LimitPairEngine:
                 slug = contract.slug
                 resolved += 1
                 self._contract_cache[slug] = contract
+                self._window_start_by_slug[slug] = start_ts
                 if slug in self._done_slugs:
                     continue
                 new_queue.append(
@@ -493,6 +667,9 @@ class LimitPairEngine:
     def _place_window_pair(self, job: _WindowJob) -> _PlaceStatus:
         contract = job.contract
         slug = contract.slug
+        if job.start_ts > 0:
+            self._window_start_by_slug[slug] = job.start_ts
+        self._contract_cache[slug] = contract
 
         if self._wallet_blocked:
             return _PlaceStatus.NOOP
@@ -634,6 +811,7 @@ class LimitPairEngine:
                     self._last_search_monotonic = now_mono
 
                 self._reconcile_done_from_clob()
+                self._run_due_window_cleanups()
                 self._maybe_log_idle()
 
                 if self._work_list:

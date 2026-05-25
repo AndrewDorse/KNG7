@@ -351,6 +351,10 @@ class BotConfig:
     limit_pair_order_spacing_seconds: float = 10.0
     limit_pair_state_path: str = "exports/limit_pair_state.json"
     limit_pair_price_tol: float = 0.01
+    # At start_ts + offset: cancel window orders, market-sell positions (default T+15s).
+    limit_pair_window_cleanup_offset_sec: int = 15
+    limit_pair_exit_sell_price: float = 0.99
+    limit_pair_cleanup_verify_rounds: int = 3
 
     @property
     def window_minutes(self) -> int:
@@ -753,6 +757,16 @@ class BotConfig:
             ).strip()
             or "exports/limit_pair_state.json",
             limit_pair_price_tol=max(0.001, _env_float("BOT_LIMIT_PAIR_PRICE_TOL", 0.01)),
+            limit_pair_window_cleanup_offset_sec=max(
+                1, _env_int("BOT_LIMIT_PAIR_WINDOW_CLEANUP_OFFSET_SEC", 15)
+            ),
+            limit_pair_exit_sell_price=min(
+                0.99,
+                max(0.01, round(_env_float("BOT_LIMIT_PAIR_EXIT_SELL_PX", 0.99), 2)),
+            ),
+            limit_pair_cleanup_verify_rounds=max(
+                1, _env_int("BOT_LIMIT_PAIR_CLEANUP_VERIFY_ROUNDS", 3)
+            ),
         )
         if cfg.strategy_mode in ("paladin_v7", "paladin_v9") and (
             cfg.strategy_budget_cap_usdc + 1e-9 < cfg.strategy_min_budget_usdc

@@ -1178,6 +1178,91 @@ class PolymarketTrader:
             LOGGER.debug("Cancel failed %s: %s", order_id, exc)
             return False
 
+    def _order_status_upper(self, order_id: str) -> str:
+        try:
+            o = self.get_order(order_id)
+            return str(
+                o.get("status") or o.get("order_status") or o.get("state") or ""
+            ).upper()
+        except Exception:
+            return ""
+
+    def cancel_order_confirmed(
+        self,
+        order_id: str,
+        *,
+        open_orders: list[dict[str, Any]] | None = None,
+        max_wait_sec: float = 4.0,
+    ) -> bool:
+        """Cancel and poll until the order is gone or status is CANCELLED."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return False
+        if not self.cancel_order(oid):
+            return False
+        deadline = time.monotonic() + max(0.5, float(max_wait_sec))
+        while time.monotonic() < deadline:
+            st = self._order_status_upper(oid)
+            if st in ("CANCELLED", "CANCELED"):
+                return True
+            try:
+                raw = open_orders if open_orders is not None else self.get_open_orders()
+            except Exception:
+                raw = []
+            open_ids = {
+                str(o.get("id") or o.get("orderID") or "") for o in (raw or [])
+            }
+            if oid not in open_ids:
+                return True
+            time.sleep(0.25)
+        return False
+
+    def open_orders_for_token(
+        self,
+        token_id: str,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Open orders with remaining size on ``token_id`` (any side/price)."""
+        try:
+            raw = open_orders if open_orders is not None else self.get_open_orders()
+        except Exception:
+            return []
+        out: list[dict[str, Any]] = []
+        for o in raw:
+            if _open_order_token_id(o) != token_id:
+                continue
+            if _open_order_remaining_shares(o) <= 1e-6:
+                continue
+            out.append(o)
+        return out
+
+    def resting_order_shares_on_token(
+        self,
+        token_id: str,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> float:
+        """Sum remaining size on all open orders for ``token_id``."""
+        return sum(
+            _open_order_remaining_shares(o)
+            for o in self.open_orders_for_token(token_id, open_orders=open_orders)
+        )
+
+    def cancel_token_orders_confirmed(
+        self,
+        token_id: str,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, int]:
+        """Cancel all open orders on ``token_id``; returns (confirmed, attempted)."""
+        orders = self.open_orders_for_token(token_id, open_orders=open_orders)
+        if not orders:
+            return 0, 0
+        confirmed = 0
+        for o in orders:
+            oid = str(o.get("id") or o.get("orderID") or "")
+            if oid and self.cancel_order_confirmed(oid, open_orders=None):
+                confirmed += 1
+        return confirmed, len(orders)
+
     @_retry()
     def get_order(self, order_id: str) -> dict[str, Any]:
         """Fetch one order by ID."""

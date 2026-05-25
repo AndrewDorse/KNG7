@@ -1058,6 +1058,25 @@ class PolymarketTrader:
         except Exception:
             return []
 
+    def resting_buy_shares_on_token(
+        self,
+        token_id: str,
+        open_orders: list[dict[str, Any]] | None = None,
+    ) -> float:
+        """Sum all resting BUY size on ``token_id`` (any limit price)."""
+        try:
+            raw = open_orders if open_orders is not None else self.get_open_orders()
+        except Exception:
+            return 0.0
+        total = 0.0
+        for o in raw:
+            if _open_order_token_id(o) != token_id:
+                continue
+            if _open_order_side_upper(o) != BUY:
+                continue
+            total += _open_order_remaining_shares(o)
+        return total
+
     def resting_buy_shares_near(
         self,
         token_id: str,

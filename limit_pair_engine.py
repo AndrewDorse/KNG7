@@ -177,6 +177,7 @@ class LimitPairEngine:
         self._down_px = lp.limit_pair_down_px
         self._shares = lp.limit_pair_shares
         self._price_tol = lp.limit_pair_price_tol
+        self._enable_cleanup = lp.limit_pair_enable_cleanup
 
         self._state_path = _resolve_state_path(lp.limit_pair_state_path)
         self._done_slugs: set[str] = set()
@@ -288,6 +289,7 @@ class LimitPairEngine:
             f"up={self._up_px:g} down={self._down_px:g} shares={self._shares} "
             f"horizon_min={self._horizon_minutes} skip_first_at_startup={self._skip_first_windows} "
             f"slots_first_search≈{slots}{span} "
+            f"cleanup_enabled={self._enable_cleanup} "
             f"cleanup_t+{self._cleanup_offset_sec}-{self._cleanup_until_sec}s "
             f"poll={self._cleanup_poll_sec:g}s exit_px={self._exit_sell_px:g} "
             f"search_sec={self._search_interval:g} spacing_sec={self._order_spacing:g} "
@@ -475,6 +477,8 @@ class LimitPairEngine:
         self, now_ts: int
     ) -> list[tuple[str, ActiveContract, int]]:
         """Windows in T+offset…T+until (and flatten-active until flat)."""
+        if not self._enable_cleanup:
+            return []
         slug_keys = (
             set(self._contract_cache)
             | set(self._submitted_legs)
@@ -503,6 +507,8 @@ class LimitPairEngine:
 
     def _cleanup_phase_active(self, now_ts: int | None = None) -> bool:
         """True while flatten is active (pauses new limit placement)."""
+        if not self._enable_cleanup:
+            return False
         return bool(self._cleanup_flatten_active)
 
     def _window_exposure(
@@ -579,6 +585,8 @@ class LimitPairEngine:
         self, slug: str, contract: ActiveContract, start_ts: int
     ) -> None:
         """T+15…T+60: on one-side risk, cancel ALL orders + sell ALL positions in window."""
+        if not self._enable_cleanup:
+            return
         if self._wallet_blocked:
             return
 

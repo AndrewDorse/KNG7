@@ -351,8 +351,8 @@ class BotConfig:
     limit_pair_order_spacing_seconds: float = 10.0
     limit_pair_state_path: str = "exports/limit_pair_state.json"
     limit_pair_price_tol: float = 0.01
-    # If False, disable T+15 force-exit cleanup and hold positions.
-    limit_pair_enable_cleanup: bool = True
+    # Default off: buy-and-hold unless explicitly re-enabled in .env.
+    limit_pair_enable_cleanup: bool = False
     # At start_ts + offset: cancel window orders, market-sell positions (default T+15s).
     limit_pair_window_cleanup_offset_sec: int = 15
     limit_pair_window_cleanup_until_sec: int = 60
@@ -763,7 +763,7 @@ class BotConfig:
             or "exports/limit_pair_state.json",
             limit_pair_price_tol=max(0.001, _env_float("BOT_LIMIT_PAIR_PRICE_TOL", 0.01)),
             limit_pair_enable_cleanup=_env_bool(
-                "BOT_LIMIT_PAIR_ENABLE_CLEANUP", True
+                "BOT_LIMIT_PAIR_ENABLE_CLEANUP", False
             ),
             limit_pair_window_cleanup_offset_sec=max(
                 1, _env_int("BOT_LIMIT_PAIR_WINDOW_CLEANUP_OFFSET_SEC", 15)

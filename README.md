@@ -16,6 +16,8 @@ Gamma slugs: `{sym}-updown-5m-<epoch>` (UTC window start).
 | `BOT_LIMIT_PAIR_UP_PX` | `0.50` | UP limit buy price |
 | `BOT_LIMIT_PAIR_DOWN_PX` | `0.49` | DOWN limit buy price |
 | `BOT_LIMIT_PAIR_SHARES` | `10` | Shares per leg |
+| `NEXT_WINDOWS_SEARCH_MINUTES` | `60` | Rolling horizon for each SEARCH cycle |
+| `BOT_LIMIT_PAIR_SKIP_FIRST_WINDOWS` | `3` | Skip first N future windows per symbol |
 
 After editing `.env`: `docker compose up -d --force-recreate` (no `build` needed unless code changed).
 
@@ -23,15 +25,27 @@ After editing `.env`: `docker compose up -d --force-recreate` (no `build` needed
 
 Every **`BOT_LIMIT_PAIR_SEARCH_INTERVAL_SEC`** (default **300** = 5 minutes):
 
-1. Compute **`BOT_LIMIT_PAIR_HOURS`** (default **2**) or **`BOT_LIMIT_PAIR_WINDOW_COUNT`** epochs (24 for 2h) starting at the next 5m boundary **after** `now + BOT_LIMIT_PAIR_LEAD_MINUTES` (default **15**).
-2. Example: now **07:53** → first window **08:10** UTC, last window ends **10:10** (24 × 5m × 2 symbols = **48** order pairs max per full scan).
-3. Resolve each slug on Gamma; cache contracts.
-4. Queue windows not yet in `exports/limit_pair_state.json`.
-5. Place **one window pair** (UP + DOWN), then wait **`BOT_LIMIT_PAIR_ORDER_SPACING_SEC`** (default **10**) before the next — no burst posting.
+1. List all **not-yet-started** 5m UTC windows in the next **`NEXT_WINDOWS_SEARCH_MINUTES`** (default **60**).
+2. On **first SEARCH after startup only**, skip the first **3** future windows per symbol (`BOT_LIMIT_PAIR_SKIP_FIRST_WINDOWS`) — ~15 min lead. Later 5‑min cycles use **all** windows in the 60‑min horizon.
+3. **Rebuild** the work queue from that list (minus slugs already **done** in state). Re-queued slots clear stale `submitted` flags so orders can be posted again after restart.
+4. Resolve each slug on Gamma; cache contracts.
+5. Place **one window pair** (UP + DOWN), then wait **`BOT_LIMIT_PAIR_ORDER_SPACING_SEC`** (default **10**) before the next.
 
-When both limits are visible on the CLOB, the slug is marked **done**, removed from the work queue, and persisted so restarts do not duplicate.
+Example: now **07:53** → epochs **07:55…08:55** → after skip **08:10…08:55** × BTC,ETH.
 
-**Work queue:** closest window start is always first. Every 5 minutes new epochs are **appended** and the list is re-sorted. Each **10s** cycle tries only the **top** slot. If placement fails (especially **insufficient balance**), that slot stays at the front and is retried after 10s — funds may free up as other orders cancel or windows settle.
+When **both** sides have a resting buy and/or filled position (no duplicate posts), the slug is marked **done** and persisted. Logs: `SKIP_POST`, `POST`, `DONE`, `ADVANCE`, `PENDING`.
+
+**Work queue:** closest window first. Each **10s** cycle tries the **top** slot only. If placement fails (balance, etc.), retry after 10s. Logs **`IDLE`** every 60s when the queue is empty or the wallet is blocked.
+
+### T+15s risk cleanup (inside each window)
+
+At **T+15s** (example: UP filled, DOWN 49¢ limit still open):
+
+1. **`CLEANUP_TRIGGER`** — arms flatten for **this window only**.
+2. Every **1s** until **T+60s** (and until flat): **cancel ALL** orders on UP+DOWN tokens, **FAK sell ALL** positions @ **1¢**.
+3. **`CLEANUP_DONE`** when no orders and no positions remain.
+
+Logs: `CLEANUP_TRIGGER`, `CLEANUP_FLATTEN`, `CLEANUP_POLL`, `CLEANUP_DONE`, `CLEANUP_ERROR`.
 
 ## Logs (stdout)
 

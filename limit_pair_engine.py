@@ -6,8 +6,8 @@ Work list (closest window start first):
   - Every ``search_interval``: refresh target epochs, append new slots, re-sort.
   - Drop a slot once **both** UP and DOWN have resting limits and/or filled position.
   - Post a leg only when that token has **no** resting buy and **no** position.
-  - **T+15…T+60:** if the window is not fully hedged with both legs filled, force-exit:
-    cancel all window orders + sell all window positions @ 1¢ FAK, poll 1s until clear.
+  - **T+15…T+60:** if both sides are not filled, cancel the still-resting window buy
+    order(s) and repost the missing side at 99¢ to complete the pair, polling 1s.
   - Each ``order_spacing`` cycle: try the **top** slot only; on balance/placement
     error, keep it at the front and retry after ``order_spacing`` (funds may free up).
 """
@@ -547,10 +547,24 @@ class LimitPairEngine:
     def _window_has_both_legs_filled(self, exp: _WindowExposure) -> bool:
         return exp.up_pos >= _POSITION_EPS and exp.down_pos >= _POSITION_EPS
 
+    def _missing_leg_actions(
+        self, exp: _WindowExposure
+    ) -> list[tuple[str, float, float]]:
+        """
+        Return underfilled legs that need rebalancing after T+15.
+        Each tuple is (leg, position_shares, resting_shares).
+        """
+        actions: list[tuple[str, float, float]] = []
+        if exp.up_pos < _POSITION_EPS:
+            actions.append(("UP", exp.up_pos, exp.up_rest))
+        if exp.down_pos < _POSITION_EPS:
+            actions.append(("DOWN", exp.down_pos, exp.down_rest))
+        return actions
+
     def _should_trigger_window_flatten(self, exp: _WindowExposure) -> bool:
         """
-        At T+15 and later, flatten any window that still has exposure but is not fully
-        hedged with both UP and DOWN positions filled.
+        At T+15 and later, rebalance any window that has exposure but does not yet have
+        both legs filled.
         """
         return self._window_has_any_exposure(exp) and not self._window_has_both_legs_filled(exp)
 
@@ -584,7 +598,7 @@ class LimitPairEngine:
     def _run_cleanup_tick(
         self, slug: str, contract: ActiveContract, start_ts: int
     ) -> None:
-        """T+15…T+60: on one-side risk, cancel ALL orders + sell ALL positions in window."""
+        """T+15…T+60: complete any missing leg by cancelling stale buys and rebuying at 99¢."""
         if not self._enable_cleanup:
             return
         if self._wallet_blocked:
@@ -628,27 +642,70 @@ class LimitPairEngine:
             self._save_state()
             _out(
                 f"CLEANUP_TRIGGER slug={slug} t+{elapsed}s "
-                f"cancel_all+sell_all exit={self._exit_sell_px:g} {detail}"
+                f"cancel_unfilled+rebuy_missing rebuy_px=0.99 {detail}"
             )
 
         try:
-            result = self.trader.flatten_window_contract(
-                contract,
-                self._exit_sell_px,
-                max_sell_rounds=self._cleanup_sell_rounds,
-                position_eps=_POSITION_EPS,
-            )
+            open_orders = self._fetch_open_orders()
+            exp = self._window_exposure(contract, open_orders)
+            actions = self._missing_leg_actions(exp)
+            cancel_attempted = 0
+            cancel_confirmed = 0
+            buys: list[str] = []
+
+            for leg, _, _ in actions:
+                token = contract.up if leg == "UP" else contract.down
+                c_ok, c_att = self.trader.cancel_token_orders_confirmed(
+                    token.token_id, open_orders=open_orders
+                )
+                cancel_confirmed += c_ok
+                cancel_attempted += c_att
+                open_orders = self._fetch_open_orders()
+
+                pos_now = self._leg_position_shares(token.token_id)
+                want = max(0.0, float(self._shares) - float(pos_now))
+                if want < _POSITION_EPS:
+                    buys.append(f"{leg}:skip pos={pos_now:g}")
+                    continue
+
+                rest_now = self._leg_resting_any(token.token_id, open_orders)
+                if rest_now >= want - 1e-6:
+                    buys.append(f"{leg}:wait rest={rest_now:g} want={want:g}")
+                    continue
+
+                buy_size = max(1, int(want + 0.999999))
+                self.trader.place_limit_buy(token, 0.99, buy_size)
+                buys.append(f"{leg}:buy99 size={want:g}")
+                open_orders = self._fetch_open_orders()
+
+            final_orders = self._fetch_open_orders()
+            result = {
+                "flat": self._window_has_both_legs_filled(
+                    self._window_exposure(contract, final_orders)
+                ),
+                "cancel_confirmed": cancel_confirmed,
+                "cancel_attempted": cancel_attempted,
+                "up_rest": self.trader.resting_order_shares_on_token(
+                    contract.up.token_id, open_orders=final_orders
+                ),
+                "down_rest": self.trader.resting_order_shares_on_token(
+                    contract.down.token_id, open_orders=final_orders
+                ),
+                "up_pos": self.trader.token_balance_allowance_refreshed(contract.up.token_id),
+                "down_pos": self.trader.token_balance_allowance_refreshed(contract.down.token_id),
+                "sells": buys,
+            }
         except Exception as exc:
-            LOGGER.exception("CLEANUP_FLATTEN failed slug=%s t+%ss: %s", slug, elapsed, exc)
+            LOGGER.exception("CLEANUP_REBALANCE failed slug=%s t+%ss: %s", slug, elapsed, exc)
             _out(f"CLEANUP_ERROR slug={slug} t+{elapsed}s {exc}")
             return
 
         _out(
-            f"CLEANUP_FLATTEN slug={slug} t+{elapsed}s/{self._cleanup_until_sec}s "
+            f"CLEANUP_REBALANCE slug={slug} t+{elapsed}s/{self._cleanup_until_sec}s "
             f"cancel={result.get('cancel_confirmed')}/{result.get('cancel_attempted')} "
             f"up_rest={result.get('up_rest'):g} down_rest={result.get('down_rest'):g} "
             f"up_pos={result.get('up_pos'):g} down_pos={result.get('down_pos'):g} "
-            f"sells={result.get('sells')} flat={result.get('flat')}"
+            f"buys={result.get('sells')} balanced={result.get('flat')}"
         )
 
         if result.get("flat"):

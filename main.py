@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KNG7 Docker: **limit_pair_5m** — schedule UP/DOWN GTC limits on upcoming multi-asset 5m windows."""
+"""KNG7 Docker entrypoint."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 
 
 def _configure_logging() -> None:
-    """Keep HTTP/SDK quiet. App logger defaults to ERROR (only errors); INIT/DEAL/WIN go to stdout."""
+    """Quiet noisy dependencies while preserving bot error output."""
     for name in (
         "urllib3",
         "requests",
@@ -39,17 +39,15 @@ def main() -> int:
     from market_locator import GammaMarketLocator  # noqa: PLC0415
     from trader import PolymarketTrader, wallet_config_hint_for_error  # noqa: PLC0415
 
-    from limit_pair_engine import LimitPairEngine  # noqa: PLC0415
-
     try:
         config = BotConfig.from_env()
     except BotConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         return 2
 
-    if config.strategy_mode != "limit_pair_5m":
+    if config.strategy_mode not in ("limit_pair_5m", "late_high_5m"):
         print(
-            "KNG7 image expects BOT_STRATEGY_MODE=limit_pair_5m "
+            "KNG7 image expects BOT_STRATEGY_MODE=late_high_5m or limit_pair_5m "
             f"(got {config.strategy_mode!r}).",
             file=sys.stderr,
         )
@@ -75,7 +73,14 @@ def main() -> int:
             print(wallet_config_hint_for_error(Exception(detail)), file=sys.stderr)
             return 2
 
-    LimitPairEngine(config, locator, trader).run()
+    if config.strategy_mode == "late_high_5m":
+        from late_high_engine import LateHighEngine  # noqa: PLC0415
+
+        LateHighEngine(config, locator, trader).run()
+    else:
+        from limit_pair_engine import LimitPairEngine  # noqa: PLC0415
+
+        LimitPairEngine(config, locator, trader).run()
     return 0
 
 

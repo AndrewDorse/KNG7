@@ -123,6 +123,8 @@ def _normalize_strategy_mode(raw: str | None) -> str:
         return "first_cheap_03"
     if s in ("limit_pair_5m", "limit_pair", "dual_limit_5m", "btc5m_limit_pair"):
         return "limit_pair_5m"
+    if s in ("late_high_5m", "late_high", "late_high_dominant", "btc5m_late_high"):
+        return "late_high_5m"
     if s in ("iy2", "iy_2", "wallet_overlap", "wallet_overlap_live", "iy2_live"):
         return "iy2"
     if s in ("iy3", "iy_3", "wallet_overlap_path", "wallet_overlap_path_live", "iy3_live"):
@@ -360,6 +362,22 @@ class BotConfig:
     limit_pair_exit_sell_price: float = 0.01
     limit_pair_cleanup_poll_sec: float = 1.0
     limit_pair_cleanup_sell_max_rounds: int = 8
+    # late_high_5m - late-window dominant-leg 99c GTC limit buy.
+    late_high_entry_lo_sec: int = 290
+    late_high_entry_hi_sec: int = 299
+    late_high_fallback_sec: int = 295
+    late_high_min_leg_px: float = 0.80
+    late_high_limit_px: float = 0.99
+    late_high_min_shares: float = 5.0
+    late_high_early_base_gap_usd: float = 75.0
+    late_high_late_base_gap_usd: float = 0.0
+    late_high_range_lookback_sec: int = 30
+    late_high_range_gap_mult: float = 0.05
+    late_high_volume_sqrt_gap_mult: float = 0.50
+    late_high_max_recent_range_usd: float = 150.0
+    late_high_max_move_10s_usd: float = 0.0
+    late_high_stats_refresh_seconds: float = 5.0
+    late_high_state_path: str = "exports/late_high_state.json"
 
     @property
     def window_minutes(self) -> int:
@@ -782,6 +800,24 @@ class BotConfig:
             limit_pair_cleanup_sell_max_rounds=max(
                 1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
+            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 290)),
+            late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 299)),
+            late_high_fallback_sec=max(0, _env_int("BOT_LATE_HIGH_FALLBACK_SEC", 295)),
+            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.80))),
+            late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
+            late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
+            late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
+            late_high_late_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_LATE_BASE_GAP_USD", 0.0)),
+            late_high_range_lookback_sec=max(1, _env_int("BOT_LATE_HIGH_RANGE_LOOKBACK_SEC", 30)),
+            late_high_range_gap_mult=max(0.0, _env_float("BOT_LATE_HIGH_RANGE_GAP_MULT", 0.05)),
+            late_high_volume_sqrt_gap_mult=max(0.0, _env_float("BOT_LATE_HIGH_VOLUME_SQRT_GAP_MULT", 0.50)),
+            late_high_max_recent_range_usd=max(0.0, _env_float("BOT_LATE_HIGH_MAX_RECENT_RANGE_USD", 150.0)),
+            late_high_max_move_10s_usd=max(0.0, _env_float("BOT_LATE_HIGH_MAX_MOVE_10S_USD", 0.0)),
+            late_high_stats_refresh_seconds=max(1.0, _env_float("BOT_LATE_HIGH_STATS_REFRESH_SECONDS", 5.0)),
+            late_high_state_path=os.getenv(
+                "BOT_LATE_HIGH_STATE_PATH", "exports/late_high_state.json"
+            ).strip()
+            or "exports/late_high_state.json",
         )
         if cfg.strategy_mode in ("paladin_v7", "paladin_v9") and (
             cfg.strategy_budget_cap_usdc + 1e-9 < cfg.strategy_min_budget_usdc
@@ -821,6 +857,13 @@ class BotConfig:
                     raise BotConfigError(
                         f"{name} must be between 0.01 and 0.99 (got {px})."
                     )
+        if cfg.strategy_mode == "late_high_5m":
+            if cfg.late_high_entry_lo_sec > cfg.late_high_entry_hi_sec:
+                raise BotConfigError("BOT_LATE_HIGH_ENTRY_LO_SEC must be <= BOT_LATE_HIGH_ENTRY_HI_SEC")
+            if cfg.late_high_fallback_sec < cfg.late_high_entry_lo_sec:
+                raise BotConfigError("BOT_LATE_HIGH_FALLBACK_SEC must be >= BOT_LATE_HIGH_ENTRY_LO_SEC")
+            if cfg.late_high_limit_px * cfg.late_high_min_shares <= 0:
+                raise BotConfigError("BOT_LATE_HIGH_LIMIT_PX * BOT_LATE_HIGH_MIN_SHARES must be > 0")
         return cfg
 
 

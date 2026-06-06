@@ -1,14 +1,15 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-05-24-limit-pair-multi-5m
-LABEL org.opencontainers.image.title="KNG7 limit_pair_5m" \
-      org.opencontainers.image.description="Docker: scheduled multi-asset 5m UP/DOWN GTC limits (50c/49c)" \
+ARG KNG7_IMAGE_TAG=2026-06-06-late-high-5m
+LABEL org.opencontainers.image.title="KNG7 late_high_5m" \
+      org.opencontainers.image.description="Docker: BTC 5m late-high dominant 99c GTC limit buy" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    BOT_LIMIT_PAIR_STATE_PATH=/app/data/limit_pair_state.json
+    BOT_LIMIT_PAIR_STATE_PATH=/app/data/limit_pair_state.json \
+    BOT_LATE_HIGH_STATE_PATH=/app/data/late_high_state.json
 
 WORKDIR /app
 
@@ -24,6 +25,7 @@ RUN pip install --upgrade pip && \
 
 COPY main.py /app/main.py
 COPY limit_pair_engine.py /app/limit_pair_engine.py
+COPY late_high_engine.py /app/late_high_engine.py
 COPY check_wallet.py /app/check_wallet.py
 COPY config.py /app/config.py
 COPY trader.py /app/trader.py

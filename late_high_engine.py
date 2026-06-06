@@ -137,6 +137,8 @@ class LateHighEngine:
         self._submitted_slugs: set[str] = set()
         self._w = _WindowState()
         self._last_idle_log_mono = 0.0
+        self._cached_balance_usdc: float | None = None
+        self._next_balance_refresh_mono = 0.0
         self._load_state()
 
     def _load_state(self) -> None:
@@ -174,6 +176,7 @@ class LateHighEngine:
                 self.config.request_timeout_seconds,
             )
         self._w = _WindowState(slug=contract.slug, start_btc=start_btc)
+        self.trader.sync_ws_subscriptions([contract])
 
     def _update_btc_metrics(self, contract: ActiveContract, btc: float) -> tuple[float, float]:
         now_ts = int(time.time())
@@ -263,6 +266,18 @@ class LateHighEngine:
             return None
         return shares, cost
 
+    def _balance_usdc(self) -> float:
+        if self.config.dry_run:
+            return max(
+                self.config.late_high_limit_px * self.config.late_high_min_shares,
+                10.0,
+            )
+        mono = time.monotonic()
+        if self._cached_balance_usdc is None or mono >= self._next_balance_refresh_mono:
+            self._cached_balance_usdc = self.trader.wallet_balance_usdc()
+            self._next_balance_refresh_mono = mono + self.config.late_high_balance_refresh_seconds
+        return self._cached_balance_usdc
+
     def _tick(self) -> None:
         contract = self.locator.get_active_contract_for_window_minutes(_WINDOW_MINUTES)
         if contract is None:
@@ -284,8 +299,12 @@ class LateHighEngine:
             self._w.start_btc = btc
         recent_range, move10 = self._update_btc_metrics(contract, btc)
 
-        up_mid = self.trader.get_midpoint(contract.up.token_id)
-        down_mid = self.trader.get_midpoint(contract.down.token_id)
+        if self.trader.ws_quotes_active:
+            up_mid = self.trader.get_ws_midpoint(contract.up.token_id)
+            down_mid = self.trader.get_ws_midpoint(contract.down.token_id)
+        else:
+            up_mid = self.trader.get_midpoint(contract.up.token_id)
+            down_mid = self.trader.get_midpoint(contract.down.token_id)
         if up_mid is None or down_mid is None:
             return
 
@@ -310,13 +329,10 @@ class LateHighEngine:
         side, req_gap = sig
         token = contract.up if side == "UP" else contract.down
         limit_px = self.config.late_high_limit_px
-        if self.config.dry_run:
-            balance = max(limit_px * self.config.late_high_min_shares, 10.0)
-        else:
-            balance = self.trader.wallet_balance_usdc()
-            if balance <= 0:
-                _out(f"SKIP slug={contract.slug} reason=no_usdc_balance elapsed={elapsed}s")
-                return
+        balance = self._balance_usdc()
+        if not self.config.dry_run and balance <= 0:
+            _out(f"SKIP slug={contract.slug} reason=no_usdc_balance elapsed={elapsed}s")
+            return
         sized = self._shares_for_balance(balance)
         if sized is None:
             need = self.config.late_high_limit_px * self.config.late_high_min_shares
@@ -350,6 +366,7 @@ class LateHighEngine:
             f"min_shares={self.config.late_high_min_shares:g} entry={self.config.late_high_entry_lo_sec}-"
             f"{self.config.late_high_entry_hi_sec}s fallback={self.config.late_high_fallback_sec}s "
             f"min_leg={self.config.late_high_min_leg_px:.2f} dry_run={self.config.dry_run} "
+            f"balance_refresh={self.config.late_high_balance_refresh_seconds:g}s "
             f"state={self._state_path}"
         )
         while True:

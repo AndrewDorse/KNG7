@@ -331,6 +331,11 @@ class PolymarketTrader:
             return None
         return bid, ask, (bid + ask) / 2.0
 
+    def get_ws_midpoint(self, token_id: str) -> float | None:
+        """Midpoint from the market WebSocket only; returns None until a fresh quote exists."""
+        ws = self._ws_bid_ask_mid(token_id)
+        return ws[2] if ws is not None else None
+
     def _rest_midpoint_clob(self, token_id: str) -> float | None:
         """CLOB ``/midpoint`` (works when one side of the book is empty)."""
         try:

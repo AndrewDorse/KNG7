@@ -145,7 +145,7 @@ class BotConfig:
     bot_version: str = "2026-04-15 19:10:00"
     signature_type: int = 0
     dry_run: bool = True
-    poll_interval_seconds: float = 1.0
+    poll_interval_seconds: float = 0.25
     request_timeout_seconds: float = 10.0
     log_level: str = "INFO"
     relayer_api_key: str = ""
@@ -215,7 +215,7 @@ class BotConfig:
     polymarket_ws_enabled: bool = True
     polymarket_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     # Drop WS quote and fall back to REST book if older than this (seconds).
-    polymarket_ws_max_age_seconds: float = 12.0
+    polymarket_ws_max_age_seconds: float = 2.0
     polymarket_fak_confirm_get_order: bool = True
     # PALADIN live (pair-only): primary goal is a low *held* pair cost (avg_up + avg_down after fills), not chasing
     # instantaneous pm_up+pm_down (often ~1.0 in an efficient book). Stagger second leg: default uses post-fill
@@ -363,10 +363,10 @@ class BotConfig:
     limit_pair_cleanup_poll_sec: float = 1.0
     limit_pair_cleanup_sell_max_rounds: int = 8
     # late_high_5m - late-window dominant-leg 99c GTC limit buy.
-    late_high_entry_lo_sec: int = 290
+    late_high_entry_lo_sec: int = 280
     late_high_entry_hi_sec: int = 299
     late_high_fallback_sec: int = 295
-    late_high_min_leg_px: float = 0.80
+    late_high_min_leg_px: float = 0.85
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
     late_high_early_base_gap_usd: float = 75.0
@@ -377,6 +377,7 @@ class BotConfig:
     late_high_max_recent_range_usd: float = 150.0
     late_high_max_move_10s_usd: float = 0.0
     late_high_stats_refresh_seconds: float = 5.0
+    late_high_balance_refresh_seconds: float = 60.0
     late_high_state_path: str = "exports/late_high_state.json"
 
     @property
@@ -509,7 +510,7 @@ class BotConfig:
             relayer_secret=os.getenv("RELAYER_SECRET", ""),
             relayer_passphrase=os.getenv("RELAYER_PASSPHRASE", ""),
             dry_run=_env_bool("POLY_DRY_RUN", True),
-            poll_interval_seconds=_env_float("BOT_POLL_INTERVAL_SECONDS", 1.0),
+            poll_interval_seconds=_env_float("BOT_POLL_INTERVAL_SECONDS", 0.25),
             request_timeout_seconds=_env_float("BOT_REQUEST_TIMEOUT_SECONDS", 10.0),
             log_level=os.getenv("BOT_LOG_LEVEL", "INFO").upper(),
             force_exit_before_end_seconds=_env_int("BOT_FORCE_EXIT_BEFORE_END_SECONDS", 15),
@@ -570,7 +571,7 @@ class BotConfig:
                 "BOT_POLY_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"
             ).strip(),
             polymarket_ws_max_age_seconds=max(
-                0.5, _env_float("BOT_POLY_WS_MAX_AGE_SEC", 12.0)
+                0.5, _env_float("BOT_POLY_WS_MAX_AGE_SEC", 2.0)
             ),
             polymarket_fak_confirm_get_order=_env_bool("BOT_POLY_FAK_CONFIRM_ORDER", True),
             paladin_pair_sum_max=_env_float("BOT_PALADIN_PAIR_SUM_MAX", 0.97),
@@ -800,10 +801,10 @@ class BotConfig:
             limit_pair_cleanup_sell_max_rounds=max(
                 1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
-            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 290)),
+            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 280)),
             late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 299)),
             late_high_fallback_sec=max(0, _env_int("BOT_LATE_HIGH_FALLBACK_SEC", 295)),
-            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.80))),
+            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.85))),
             late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
             late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
@@ -814,6 +815,7 @@ class BotConfig:
             late_high_max_recent_range_usd=max(0.0, _env_float("BOT_LATE_HIGH_MAX_RECENT_RANGE_USD", 150.0)),
             late_high_max_move_10s_usd=max(0.0, _env_float("BOT_LATE_HIGH_MAX_MOVE_10S_USD", 0.0)),
             late_high_stats_refresh_seconds=max(1.0, _env_float("BOT_LATE_HIGH_STATS_REFRESH_SECONDS", 5.0)),
+            late_high_balance_refresh_seconds=max(1.0, _env_float("BOT_LATE_HIGH_BALANCE_REFRESH_SECONDS", 60.0)),
             late_high_state_path=os.getenv(
                 "BOT_LATE_HIGH_STATE_PATH", "exports/late_high_state.json"
             ).strip()

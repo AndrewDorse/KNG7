@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BTC and ETH 5m late-price 99c GTC limit-buy engine."""
+"""Multi-asset 5m late-price 99c GTC limit-buy engine."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 import time
 from pathlib import Path
 
+from binance_ws import BinancePriceFeed
 from config import ActiveContract, BotConfig, LOGGER
 from market_locator import GammaMarketLocator
 from trader import PolymarketTrader
@@ -67,6 +68,16 @@ class LateHighEngine:
         self._last_idle_log_mono: dict[str, float] = {}
         self._cached_balance_usdc: float | None = None
         self._next_balance_refresh_mono = 0.0
+        self._quarantine_until: dict[str, float] = {}
+        self._last_quarantine_log_mono: dict[str, float] = {}
+        self._binance_feed: BinancePriceFeed | None = None
+        if config.late_high_binance_ws_enabled:
+            self._binance_feed = BinancePriceFeed(
+                config.late_high_symbols,
+                url=config.late_high_binance_ws_url,
+                history_seconds=config.late_high_adverse_lookback_seconds + 10.0,
+            )
+            self._binance_feed.start()
         self._load_state()
 
     def _load_state(self) -> None:
@@ -146,6 +157,54 @@ class LateHighEngine:
             return None
         return shares, cost
 
+    def _momentum_allows_entry(
+        self,
+        *,
+        symbol: str,
+        contract: ActiveContract,
+        side: str,
+        elapsed: int,
+    ) -> bool:
+        if self._binance_feed is None:
+            _out(f"SKIP symbol={symbol} slug={contract.slug} reason=binance_ws_disabled")
+            return False
+        move_bps = self._binance_feed.move_bps(
+            symbol,
+            lookback_seconds=self.config.late_high_adverse_lookback_seconds,
+            max_age_seconds=self.config.late_high_binance_max_age_seconds,
+        )
+        if move_bps is None:
+            _out(
+                f"SKIP symbol={symbol} slug={contract.slug} "
+                "reason=binance_momentum_unavailable"
+            )
+            return False
+
+        now = time.time()
+        blocked_until = self._quarantine_until.get(contract.slug, 0.0)
+        if now < blocked_until:
+            mono = time.monotonic()
+            if mono - self._last_quarantine_log_mono.get(contract.slug, 0.0) >= 5.0:
+                _out(
+                    f"SKIP symbol={symbol} slug={contract.slug} reason=quarantine "
+                    f"remaining={blocked_until - now:.1f}s move10_bps={move_bps:.3f}"
+                )
+                self._last_quarantine_log_mono[contract.slug] = mono
+            return False
+
+        adverse_bps = -move_bps if side == "UP" else move_bps
+        if adverse_bps >= self.config.late_high_adverse_move_bps:
+            until = now + self.config.late_high_quarantine_seconds
+            self._quarantine_until[contract.slug] = until
+            self._last_quarantine_log_mono[contract.slug] = time.monotonic()
+            _out(
+                f"QUARANTINE symbol={symbol} slug={contract.slug} side={side} "
+                f"move10_bps={move_bps:.3f} adverse_bps={adverse_bps:.3f} "
+                f"until_elapsed={elapsed + self.config.late_high_quarantine_seconds:.1f}s"
+            )
+            return False
+        return True
+
     def _balance_usdc(self) -> float:
         if self.config.dry_run:
             return max(
@@ -215,6 +274,13 @@ class LateHighEngine:
                     self._last_idle_log_mono[symbol] = mono
                 continue
             side, signal_px = signal
+            if not self._momentum_allows_entry(
+                symbol=symbol,
+                contract=contract,
+                side=side,
+                elapsed=elapsed,
+            ):
+                continue
             self._submit(
                 symbol=symbol,
                 contract=contract,
@@ -232,6 +298,9 @@ class LateHighEngine:
             f"limit={self.config.late_high_limit_px:.2f} "
             f"balance_fraction={self.config.late_high_balance_fraction:.2f} "
             f"min_shares={self.config.late_high_min_shares:g} "
+            f"adverse={self.config.late_high_adverse_move_bps:g}bps/"
+            f"{self.config.late_high_adverse_lookback_seconds:g}s "
+            f"quarantine={self.config.late_high_quarantine_seconds:g}s "
             f"poll={self.config.poll_interval_seconds:g}s dry_run={self.config.dry_run} "
             f"state={self._state_path}"
         )

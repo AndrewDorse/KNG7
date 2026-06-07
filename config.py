@@ -369,8 +369,14 @@ class BotConfig:
     late_high_min_leg_px: float = 0.96
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
-    late_high_symbols: tuple[str, ...] = ("BTC", "ETH")
-    late_high_balance_fraction: float = 0.30
+    late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
+    late_high_balance_fraction: float = 0.15
+    late_high_binance_ws_enabled: bool = True
+    late_high_binance_ws_url: str = "wss://stream.binance.com:9443/stream"
+    late_high_adverse_lookback_seconds: float = 10.0
+    late_high_adverse_move_bps: float = 1.6
+    late_high_quarantine_seconds: float = 20.0
+    late_high_binance_max_age_seconds: float = 2.0
     late_high_early_base_gap_usd: float = 75.0
     late_high_late_base_gap_usd: float = 0.0
     late_high_range_lookback_sec: int = 30
@@ -810,10 +816,30 @@ class BotConfig:
             late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
             late_high_symbols=_parse_symbol_list(
-                os.getenv("BOT_LATE_HIGH_SYMBOLS"), default=("BTC", "ETH")
+                os.getenv("BOT_LATE_HIGH_SYMBOLS"), default=("BTC", "ETH", "SOL", "XRP")
             ),
             late_high_balance_fraction=max(
-                0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.30))
+                0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.15))
+            ),
+            late_high_binance_ws_enabled=_env_bool("BOT_LATE_HIGH_BINANCE_WS_ENABLED", True),
+            late_high_binance_ws_url=(
+                os.getenv(
+                    "BOT_LATE_HIGH_BINANCE_WS_URL",
+                    "wss://stream.binance.com:9443/stream",
+                ).strip()
+                or "wss://stream.binance.com:9443/stream"
+            ),
+            late_high_adverse_lookback_seconds=max(
+                1.0, _env_float("BOT_LATE_HIGH_ADVERSE_LOOKBACK_SECONDS", 10.0)
+            ),
+            late_high_adverse_move_bps=max(
+                0.01, _env_float("BOT_LATE_HIGH_ADVERSE_MOVE_BPS", 1.6)
+            ),
+            late_high_quarantine_seconds=max(
+                1.0, _env_float("BOT_LATE_HIGH_QUARANTINE_SECONDS", 20.0)
+            ),
+            late_high_binance_max_age_seconds=max(
+                0.25, _env_float("BOT_LATE_HIGH_BINANCE_MAX_AGE_SECONDS", 2.0)
             ),
             late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
             late_high_late_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_LATE_BASE_GAP_USD", 0.0)),

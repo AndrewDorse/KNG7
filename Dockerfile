@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-06-07-btc-eth-late-price
+ARG KNG7_IMAGE_TAG=2026-06-07-four-asset-momentum
 LABEL org.opencontainers.image.title="KNG7 late_high_5m" \
-      org.opencontainers.image.description="Docker: BTC and ETH 5m price-only 99c GTC limit buys" \
+      org.opencontainers.image.description="Docker: BTC, ETH, SOL and XRP 5m momentum-guarded 99c GTC limit buys" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -33,6 +33,7 @@ COPY market_locator.py /app/market_locator.py
 COPY http_session.py /app/http_session.py
 COPY clob_fak.py /app/clob_fak.py
 COPY polymarket_ws.py /app/polymarket_ws.py
+COPY binance_ws.py /app/binance_ws.py
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 
 RUN chmod +x /docker-entrypoint.sh \

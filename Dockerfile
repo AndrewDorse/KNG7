@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-06-06-late-high-5m
+ARG KNG7_IMAGE_TAG=2026-06-07-btc-eth-late-price
 LABEL org.opencontainers.image.title="KNG7 late_high_5m" \
-      org.opencontainers.image.description="Docker: BTC 5m late-high dominant 99c GTC limit buy" \
+      org.opencontainers.image.description="Docker: BTC and ETH 5m price-only 99c GTC limit buys" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

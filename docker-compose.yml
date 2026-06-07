@@ -1,4 +1,4 @@
-# KNG7: limit_pair_5m — scheduled dual limits on upcoming 5m windows. Copy .env.example -> .env
+# KNG7: BTC + ETH late_high_5m price-only GTC limits. Copy .env.example -> .env
 services:
   bot:
     build: .

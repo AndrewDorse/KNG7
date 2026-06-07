@@ -363,12 +363,14 @@ class BotConfig:
     limit_pair_cleanup_poll_sec: float = 1.0
     limit_pair_cleanup_sell_max_rounds: int = 8
     # late_high_5m - late-window dominant-leg 99c GTC limit buy.
-    late_high_entry_lo_sec: int = 280
+    late_high_entry_lo_sec: int = 250
     late_high_entry_hi_sec: int = 299
     late_high_fallback_sec: int = 295
-    late_high_min_leg_px: float = 0.85
+    late_high_min_leg_px: float = 0.96
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
+    late_high_symbols: tuple[str, ...] = ("BTC", "ETH")
+    late_high_balance_fraction: float = 0.30
     late_high_early_base_gap_usd: float = 75.0
     late_high_late_base_gap_usd: float = 0.0
     late_high_range_lookback_sec: int = 30
@@ -801,12 +803,18 @@ class BotConfig:
             limit_pair_cleanup_sell_max_rounds=max(
                 1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
-            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 280)),
+            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 250)),
             late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 299)),
             late_high_fallback_sec=max(0, _env_int("BOT_LATE_HIGH_FALLBACK_SEC", 295)),
-            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.85))),
+            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.96))),
             late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
+            late_high_symbols=_parse_symbol_list(
+                os.getenv("BOT_LATE_HIGH_SYMBOLS"), default=("BTC", "ETH")
+            ),
+            late_high_balance_fraction=max(
+                0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.30))
+            ),
             late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
             late_high_late_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_LATE_BASE_GAP_USD", 0.0)),
             late_high_range_lookback_sec=max(1, _env_int("BOT_LATE_HIGH_RANGE_LOOKBACK_SEC", 30)),

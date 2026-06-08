@@ -8,7 +8,6 @@ import math
 import time
 from pathlib import Path
 
-from binance_ws import BinancePriceFeed
 from config import ActiveContract, BotConfig, LOGGER
 from market_locator import GammaMarketLocator
 from trader import PolymarketTrader
@@ -65,19 +64,10 @@ class LateHighEngine:
         self.trader = trader
         self._state_path = _resolve_state_path(config.late_high_state_path)
         self._submitted_slugs: set[str] = set()
+        self._pending_orders: dict[str, dict[str, object]] = {}
         self._last_idle_log_mono: dict[str, float] = {}
         self._cached_balance_usdc: float | None = None
         self._next_balance_refresh_mono = 0.0
-        self._quarantine_until: dict[str, float] = {}
-        self._last_quarantine_log_mono: dict[str, float] = {}
-        self._binance_feed: BinancePriceFeed | None = None
-        if config.late_high_binance_ws_enabled:
-            self._binance_feed = BinancePriceFeed(
-                config.late_high_symbols,
-                url=config.late_high_binance_ws_url,
-                history_seconds=config.late_high_adverse_lookback_seconds + 10.0,
-            )
-            self._binance_feed.start()
         self._load_state()
 
     def _load_state(self) -> None:
@@ -90,14 +80,27 @@ class LateHighEngine:
             return
         if isinstance(raw, dict):
             self._submitted_slugs = {str(s) for s in raw.get("submitted_slugs", [])}
+            pending = raw.get("pending_orders") or {}
+            if isinstance(pending, dict):
+                self._pending_orders = {
+                    str(slug): dict(value)
+                    for slug, value in pending.items()
+                    if isinstance(value, dict)
+                }
 
     def _save_state(self) -> None:
         cutoff = int(time.time()) - 48 * 3600
         self._submitted_slugs = {
             slug for slug in self._submitted_slugs if (_slug_start_ts(slug) or 0) >= cutoff
         }
+        self._pending_orders = {
+            slug: value
+            for slug, value in self._pending_orders.items()
+            if (_slug_start_ts(slug) or 0) >= cutoff
+        }
         payload = {
             "submitted_slugs": sorted(self._submitted_slugs),
+            "pending_orders": self._pending_orders,
             "updated_at": int(time.time()),
         }
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +132,11 @@ class LateHighEngine:
         contract: ActiveContract,
         elapsed: int,
     ) -> tuple[str, float] | None:
-        if elapsed < self.config.late_high_entry_lo_sec or elapsed > self.config.late_high_entry_hi_sec:
+        if (
+            elapsed < self.config.late_high_entry_lo_sec
+            or elapsed > self.config.late_high_entry_hi_sec
+            or elapsed >= self.config.late_high_cancel_unfilled_at_sec
+        ):
             return None
         up_mid = self._midpoint(contract.up.token_id)
         down_mid = self._midpoint(contract.down.token_id)
@@ -147,8 +154,15 @@ class LateHighEngine:
 
     def _shares_for_balance(self, balance: float) -> tuple[float, float] | None:
         px = self.config.late_high_limit_px
+        risk_budget = balance * self.config.late_high_balance_fraction
+        minimum_cost = px * self.config.late_high_min_shares
+        if (
+            self.config.late_high_strict_balance_fraction
+            and risk_budget + 1e-9 < minimum_cost
+        ):
+            return None
         shares = max(
-            (balance * self.config.late_high_balance_fraction) / px,
+            risk_budget / px,
             self.config.late_high_min_shares,
         )
         shares = math.floor(shares * 10_000) / 10_000
@@ -156,54 +170,6 @@ class LateHighEngine:
         if balance + 1e-9 < cost:
             return None
         return shares, cost
-
-    def _momentum_allows_entry(
-        self,
-        *,
-        symbol: str,
-        contract: ActiveContract,
-        side: str,
-        elapsed: int,
-    ) -> bool:
-        if self._binance_feed is None:
-            _out(f"SKIP symbol={symbol} slug={contract.slug} reason=binance_ws_disabled")
-            return False
-        move_bps = self._binance_feed.move_bps(
-            symbol,
-            lookback_seconds=self.config.late_high_adverse_lookback_seconds,
-            max_age_seconds=self.config.late_high_binance_max_age_seconds,
-        )
-        if move_bps is None:
-            _out(
-                f"SKIP symbol={symbol} slug={contract.slug} "
-                "reason=binance_momentum_unavailable"
-            )
-            return False
-
-        now = time.time()
-        blocked_until = self._quarantine_until.get(contract.slug, 0.0)
-        if now < blocked_until:
-            mono = time.monotonic()
-            if mono - self._last_quarantine_log_mono.get(contract.slug, 0.0) >= 5.0:
-                _out(
-                    f"SKIP symbol={symbol} slug={contract.slug} reason=quarantine "
-                    f"remaining={blocked_until - now:.1f}s move10_bps={move_bps:.3f}"
-                )
-                self._last_quarantine_log_mono[contract.slug] = mono
-            return False
-
-        adverse_bps = -move_bps if side == "UP" else move_bps
-        if adverse_bps >= self.config.late_high_adverse_move_bps:
-            until = now + self.config.late_high_quarantine_seconds
-            self._quarantine_until[contract.slug] = until
-            self._last_quarantine_log_mono[contract.slug] = time.monotonic()
-            _out(
-                f"QUARANTINE symbol={symbol} slug={contract.slug} side={side} "
-                f"move10_bps={move_bps:.3f} adverse_bps={adverse_bps:.3f} "
-                f"until_elapsed={elapsed + self.config.late_high_quarantine_seconds:.1f}s"
-            )
-            return False
-        return True
 
     def _balance_usdc(self) -> float:
         if self.config.dry_run:
@@ -216,6 +182,37 @@ class LateHighEngine:
             self._cached_balance_usdc = self.trader.wallet_balance_usdc()
             self._next_balance_refresh_mono = mono + self.config.late_high_balance_refresh_seconds
         return self._cached_balance_usdc
+
+    def _cancel_pending_order(self, slug: str, pending: dict[str, object], reason: str) -> None:
+        token_id = str(pending.get("token_id") or "")
+        symbol = str(pending.get("symbol") or "")
+        side = str(pending.get("side") or "")
+        if not token_id:
+            self._pending_orders.pop(slug, None)
+            self._save_state()
+            return
+        if self.config.dry_run:
+            confirmed = attempted = 1
+        else:
+            confirmed, attempted = self.trader.cancel_token_orders_confirmed(token_id)
+        _out(
+            f"CANCEL_PENDING symbol={symbol} slug={slug} side={side} reason={reason} "
+            f"confirmed={confirmed} attempted={attempted}"
+        )
+        if attempted > confirmed:
+            return
+        self._pending_orders.pop(slug, None)
+        self._save_state()
+
+    def _manage_pending_orders(self, now_ts: int) -> None:
+        for slug, pending in list(self._pending_orders.items()):
+            start_ts = _slug_start_ts(slug)
+            if start_ts is None:
+                self._pending_orders.pop(slug, None)
+                continue
+            elapsed = now_ts - start_ts
+            if elapsed >= self.config.late_high_cancel_unfilled_at_sec:
+                self._cancel_pending_order(slug, pending, "window_expiry")
 
     def _submit(
         self,
@@ -233,9 +230,16 @@ class LateHighEngine:
         sized = self._shares_for_balance(balance)
         if sized is None:
             need = self.config.late_high_limit_px * self.config.late_high_min_shares
+            risk_budget = balance * self.config.late_high_balance_fraction
+            reason = (
+                "risk_budget_below_min"
+                if self.config.late_high_strict_balance_fraction
+                and risk_budget + 1e-9 < need
+                else "insufficient_for_min_shares"
+            )
             _out(
-                f"SKIP symbol={symbol} slug={contract.slug} reason=insufficient_for_min_shares "
-                f"balance={balance:.4f} need={need:.4f}"
+                f"SKIP symbol={symbol} slug={contract.slug} reason={reason} "
+                f"balance={balance:.4f} risk_budget={risk_budget:.4f} need={need:.4f}"
             )
             return
         shares, cost = sized
@@ -255,10 +259,19 @@ class LateHighEngine:
                 f"cost={cost:.4f} elapsed={elapsed}s"
             )
         self._submitted_slugs.add(contract.slug)
+        self._pending_orders[contract.slug] = {
+            "symbol": symbol,
+            "side": side,
+            "token_id": token.token_id,
+            "submitted_at": int(time.time()),
+            "expires_at": (_slug_start_ts(contract.slug) or int(time.time()))
+            + self.config.late_high_cancel_unfilled_at_sec,
+        }
         self._save_state()
 
     def _tick(self) -> None:
         now_ts = int(time.time())
+        self._manage_pending_orders(now_ts)
         for symbol, contract in self._active_contracts(now_ts):
             if contract.slug in self._submitted_slugs:
                 continue
@@ -274,13 +287,6 @@ class LateHighEngine:
                     self._last_idle_log_mono[symbol] = mono
                 continue
             side, signal_px = signal
-            if not self._momentum_allows_entry(
-                symbol=symbol,
-                contract=contract,
-                side=side,
-                elapsed=elapsed,
-            ):
-                continue
             self._submit(
                 symbol=symbol,
                 contract=contract,
@@ -297,10 +303,9 @@ class LateHighEngine:
             f"signal_gt={self.config.late_high_min_leg_px:.2f} "
             f"limit={self.config.late_high_limit_px:.2f} "
             f"balance_fraction={self.config.late_high_balance_fraction:.2f} "
+            f"strict_fraction={self.config.late_high_strict_balance_fraction} "
             f"min_shares={self.config.late_high_min_shares:g} "
-            f"adverse={self.config.late_high_adverse_move_bps:g}bps/"
-            f"{self.config.late_high_adverse_lookback_seconds:g}s "
-            f"quarantine={self.config.late_high_quarantine_seconds:g}s "
+            f"cancel_unfilled_at={self.config.late_high_cancel_unfilled_at_sec}s "
             f"poll={self.config.poll_interval_seconds:g}s dry_run={self.config.dry_run} "
             f"state={self._state_path}"
         )

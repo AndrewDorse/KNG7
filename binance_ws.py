@@ -96,6 +96,27 @@ class BinancePriceFeed:
             return None
         return (new_px - old_px) / old_px * 10_000.0
 
+    def range_bps(
+        self,
+        symbol: str,
+        *,
+        lookback_seconds: float,
+        max_age_seconds: float,
+    ) -> float | None:
+        now = time.time()
+        cutoff = now - lookback_seconds
+        with self._lock:
+            points = list(self._prices.get(symbol.upper(), ()))
+        if not points or now - points[-1][0] > max_age_seconds:
+            return None
+        selected = [price for observed_at, price in points if observed_at >= cutoff]
+        if not selected or points[0][0] > cutoff + max_age_seconds:
+            return None
+        latest = selected[-1]
+        if latest <= 0:
+            return None
+        return (max(selected) - min(selected)) / latest * 10_000.0
+
     def _on_message(self, _ws: Any, message: str) -> None:
         try:
             envelope = json.loads(message)

@@ -363,20 +363,32 @@ class BotConfig:
     limit_pair_cleanup_poll_sec: float = 1.0
     limit_pair_cleanup_sell_max_rounds: int = 8
     # late_high_5m - late-window dominant-leg 99c GTC limit buy.
-    late_high_entry_lo_sec: int = 250
-    late_high_entry_hi_sec: int = 299
+    late_high_entry_lo_sec: int = 288
+    late_high_entry_hi_sec: int = 298
     late_high_fallback_sec: int = 295
-    late_high_min_leg_px: float = 0.96
+    late_high_min_leg_px: float = 0.97
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
-    late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP")
+    late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "BNB")
     late_high_balance_fraction: float = 0.15
+    late_high_strict_balance_fraction: bool = True
     late_high_binance_ws_enabled: bool = True
     late_high_binance_ws_url: str = "wss://stream.binance.com:9443/stream"
     late_high_adverse_lookback_seconds: float = 10.0
     late_high_adverse_move_bps: float = 1.6
     late_high_quarantine_seconds: float = 20.0
     late_high_binance_max_age_seconds: float = 2.0
+    late_high_early_confirmation_seconds: float = 15.0
+    late_high_late_confirmation_start_sec: int = 291
+    late_high_late_confirmation_seconds: float = 2.0
+    late_high_non_supporting_confirmation_seconds: float = 4.0
+    late_high_immediate_entry_start_sec: int = 296
+    late_high_trend_lookback_seconds: float = 60.0
+    late_high_trend_move_bps: float = 7.5
+    late_high_trend_range_lookback_seconds: float = 30.0
+    late_high_trend_min_range_bps: float = 2.0
+    late_high_cancel_unfilled_at_sec: int = 299
+    late_high_cancel_pending_on_adverse: bool = True
     late_high_early_base_gap_usd: float = 75.0
     late_high_late_base_gap_usd: float = 0.0
     late_high_range_lookback_sec: int = 30
@@ -809,17 +821,21 @@ class BotConfig:
             limit_pair_cleanup_sell_max_rounds=max(
                 1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
-            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 250)),
-            late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 299)),
+            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 288)),
+            late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 298)),
             late_high_fallback_sec=max(0, _env_int("BOT_LATE_HIGH_FALLBACK_SEC", 295)),
-            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.96))),
+            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.97))),
             late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
             late_high_symbols=_parse_symbol_list(
-                os.getenv("BOT_LATE_HIGH_SYMBOLS"), default=("BTC", "ETH", "SOL", "XRP")
+                os.getenv("BOT_LATE_HIGH_SYMBOLS"),
+                default=("BTC", "ETH", "SOL", "XRP", "BNB"),
             ),
             late_high_balance_fraction=max(
                 0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.15))
+            ),
+            late_high_strict_balance_fraction=_env_bool(
+                "BOT_LATE_HIGH_STRICT_BALANCE_FRACTION", True
             ),
             late_high_binance_ws_enabled=_env_bool("BOT_LATE_HIGH_BINANCE_WS_ENABLED", True),
             late_high_binance_ws_url=(
@@ -840,6 +856,42 @@ class BotConfig:
             ),
             late_high_binance_max_age_seconds=max(
                 0.25, _env_float("BOT_LATE_HIGH_BINANCE_MAX_AGE_SECONDS", 2.0)
+            ),
+            late_high_early_confirmation_seconds=max(
+                0.0, _env_float("BOT_LATE_HIGH_EARLY_CONFIRMATION_SECONDS", 15.0)
+            ),
+            late_high_late_confirmation_start_sec=max(
+                0, min(299, _env_int("BOT_LATE_HIGH_LATE_CONFIRMATION_START_SEC", 291))
+            ),
+            late_high_late_confirmation_seconds=max(
+                0.0, _env_float("BOT_LATE_HIGH_LATE_CONFIRMATION_SECONDS", 2.0)
+            ),
+            late_high_non_supporting_confirmation_seconds=max(
+                0.0,
+                _env_float("BOT_LATE_HIGH_NON_SUPPORTING_CONFIRMATION_SECONDS", 4.0),
+            ),
+            late_high_immediate_entry_start_sec=max(
+                0, min(299, _env_int("BOT_LATE_HIGH_IMMEDIATE_ENTRY_START_SEC", 296))
+            ),
+            late_high_trend_lookback_seconds=max(
+                10.0, _env_float("BOT_LATE_HIGH_TREND_LOOKBACK_SECONDS", 60.0)
+            ),
+            late_high_trend_move_bps=max(
+                0.01, _env_float("BOT_LATE_HIGH_TREND_MOVE_BPS", 7.5)
+            ),
+            late_high_trend_range_lookback_seconds=max(
+                5.0,
+                _env_float("BOT_LATE_HIGH_TREND_RANGE_LOOKBACK_SECONDS", 30.0),
+            ),
+            late_high_trend_min_range_bps=max(
+                0.0, _env_float("BOT_LATE_HIGH_TREND_MIN_RANGE_BPS", 2.0)
+            ),
+            late_high_cancel_unfilled_at_sec=max(
+                250,
+                min(300, _env_int("BOT_LATE_HIGH_CANCEL_UNFILLED_AT_SEC", 299)),
+            ),
+            late_high_cancel_pending_on_adverse=_env_bool(
+                "BOT_LATE_HIGH_CANCEL_PENDING_ON_ADVERSE", True
             ),
             late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
             late_high_late_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_LATE_BASE_GAP_USD", 0.0)),

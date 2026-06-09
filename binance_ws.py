@@ -173,11 +173,13 @@ class BinancePriceFeed:
         start_ts: int,
         *,
         max_age_seconds: float,
+        symbols: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, float] | None, str]:
         now = time.time()
         moves: dict[str, float] = {}
+        requested = symbols or self._symbols
         with self._lock:
-            for symbol in self._symbols:
+            for symbol in requested:
                 opening = self._window_opens.get((symbol, start_ts))
                 points = self._prices.get(symbol)
                 if opening is None:

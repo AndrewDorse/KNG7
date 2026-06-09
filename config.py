@@ -71,6 +71,27 @@ def _parse_symbol_list(raw: str | None, *, default: tuple[str, ...]) -> tuple[st
     return tuple(out)
 
 
+def _parse_symbol_combinations(
+    raw: str | None,
+    *,
+    default: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Parse semicolon-separated combinations such as ``BTC+ETH+DOGE;BTC+ETH+SOL``."""
+    s = (raw or "").strip()
+    if not s:
+        return default
+    combinations: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for group in s.split(";"):
+        symbols = _parse_symbol_list(group.replace("+", ","), default=())
+        if symbols and symbols not in seen:
+            seen.add(symbols)
+            combinations.append(symbols)
+    if not combinations:
+        raise BotConfigError("BOT_LATE_HIGH_COMBINATIONS must contain at least one combination.")
+    return tuple(combinations)
+
+
 def _strip_env_copy_artifacts(value: str) -> str:
     """Remove stray prefixes from pasted env values (e.g. `.git0x...` from a broken .env line)."""
     s = value.strip().strip('"').strip("'")
@@ -369,14 +390,21 @@ class BotConfig:
     late_high_min_leg_px: float = 0.98
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
-    late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "BNB")
+    late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
+    late_high_combinations: tuple[tuple[str, ...], ...] = (
+        ("BTC", "ETH", "DOGE"),
+        ("BTC", "ETH", "SOL", "XRP", "DOGE"),
+        ("ETH", "SOL", "XRP", "DOGE", "HYPE"),
+    )
     late_high_balance_fraction: float = 0.11
     late_high_strict_balance_fraction: bool = False
-    late_high_btc_bps: float = 8.0
-    late_high_eth_bps: float = 8.0
-    late_high_sol_bps: float = 8.0
+    late_high_btc_bps: float = 10.0
+    late_high_eth_bps: float = 10.0
+    late_high_sol_bps: float = 10.0
     late_high_xrp_bps: float = 10.0
     late_high_bnb_bps: float = 10.0
+    late_high_doge_bps: float = 10.0
+    late_high_hype_bps: float = 10.0
     late_high_binance_ws_enabled: bool = True
     late_high_binance_ws_url: str = "wss://stream.binance.com:9443/stream"
     late_high_adverse_lookback_seconds: float = 10.0
@@ -392,8 +420,6 @@ class BotConfig:
     late_high_trend_move_bps: float = 7.5
     late_high_trend_range_lookback_seconds: float = 30.0
     late_high_trend_min_range_bps: float = 2.0
-    late_high_cancel_unfilled_at_sec: int = 299
-    late_high_cancel_pending_on_adverse: bool = True
     late_high_early_base_gap_usd: float = 75.0
     late_high_late_base_gap_usd: float = 0.0
     late_high_range_lookback_sec: int = 30
@@ -834,7 +860,15 @@ class BotConfig:
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
             late_high_symbols=_parse_symbol_list(
                 os.getenv("BOT_LATE_HIGH_SYMBOLS"),
-                default=("BTC", "ETH", "SOL", "XRP", "BNB"),
+                default=("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"),
+            ),
+            late_high_combinations=_parse_symbol_combinations(
+                os.getenv("BOT_LATE_HIGH_COMBINATIONS"),
+                default=(
+                    ("BTC", "ETH", "DOGE"),
+                    ("BTC", "ETH", "SOL", "XRP", "DOGE"),
+                    ("ETH", "SOL", "XRP", "DOGE", "HYPE"),
+                ),
             ),
             late_high_balance_fraction=max(
                 0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.11))
@@ -842,11 +876,13 @@ class BotConfig:
             late_high_strict_balance_fraction=_env_bool(
                 "BOT_LATE_HIGH_STRICT_BALANCE_FRACTION", False
             ),
-            late_high_btc_bps=max(0.0, _env_float("BOT_LATE_HIGH_BTC_BPS", 8.0)),
-            late_high_eth_bps=max(0.0, _env_float("BOT_LATE_HIGH_ETH_BPS", 8.0)),
-            late_high_sol_bps=max(0.0, _env_float("BOT_LATE_HIGH_SOL_BPS", 8.0)),
+            late_high_btc_bps=max(0.0, _env_float("BOT_LATE_HIGH_BTC_BPS", 10.0)),
+            late_high_eth_bps=max(0.0, _env_float("BOT_LATE_HIGH_ETH_BPS", 10.0)),
+            late_high_sol_bps=max(0.0, _env_float("BOT_LATE_HIGH_SOL_BPS", 10.0)),
             late_high_xrp_bps=max(0.0, _env_float("BOT_LATE_HIGH_XRP_BPS", 10.0)),
             late_high_bnb_bps=max(0.0, _env_float("BOT_LATE_HIGH_BNB_BPS", 10.0)),
+            late_high_doge_bps=max(0.0, _env_float("BOT_LATE_HIGH_DOGE_BPS", 10.0)),
+            late_high_hype_bps=max(0.0, _env_float("BOT_LATE_HIGH_HYPE_BPS", 10.0)),
             late_high_binance_ws_enabled=_env_bool("BOT_LATE_HIGH_BINANCE_WS_ENABLED", True),
             late_high_binance_ws_url=(
                 os.getenv(
@@ -895,13 +931,6 @@ class BotConfig:
             ),
             late_high_trend_min_range_bps=max(
                 0.0, _env_float("BOT_LATE_HIGH_TREND_MIN_RANGE_BPS", 2.0)
-            ),
-            late_high_cancel_unfilled_at_sec=max(
-                250,
-                min(300, _env_int("BOT_LATE_HIGH_CANCEL_UNFILLED_AT_SEC", 299)),
-            ),
-            late_high_cancel_pending_on_adverse=_env_bool(
-                "BOT_LATE_HIGH_CANCEL_PENDING_ON_ADVERSE", True
             ),
             late_high_early_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_EARLY_BASE_GAP_USD", 75.0)),
             late_high_late_base_gap_usd=max(0.0, _env_float("BOT_LATE_HIGH_LATE_BASE_GAP_USD", 0.0)),
@@ -956,9 +985,32 @@ class BotConfig:
                         f"{name} must be between 0.01 and 0.99 (got {px})."
                     )
         if cfg.strategy_mode == "late_high_5m":
-            if cfg.late_high_symbols != ("BTC", "ETH", "SOL", "XRP", "BNB"):
+            if cfg.late_high_symbols != ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE"):
                 raise BotConfigError(
-                    "This KNG7 build requires BOT_LATE_HIGH_SYMBOLS=BTC,ETH,SOL,XRP,BNB"
+                    "This KNG7 build requires "
+                    "BOT_LATE_HIGH_SYMBOLS=BTC,ETH,SOL,XRP,BNB,DOGE"
+                )
+            supported = set(cfg.late_high_symbols) | {"HYPE"}
+            unknown = sorted(
+                {
+                    symbol
+                    for combination in cfg.late_high_combinations
+                    for symbol in combination
+                    if symbol not in supported
+                }
+            )
+            if unknown:
+                raise BotConfigError(
+                    "BOT_LATE_HIGH_COMBINATIONS contains unsupported symbols: "
+                    + ",".join(unknown)
+                )
+            if not any(
+                set(combination).issubset(set(cfg.late_high_symbols))
+                for combination in cfg.late_high_combinations
+            ):
+                raise BotConfigError(
+                    "BOT_LATE_HIGH_COMBINATIONS has no active combination within "
+                    "BOT_LATE_HIGH_SYMBOLS."
                 )
             if cfg.late_high_entry_lo_sec > cfg.late_high_entry_hi_sec:
                 raise BotConfigError("BOT_LATE_HIGH_ENTRY_LO_SEC must be <= BOT_LATE_HIGH_ENTRY_HI_SEC")

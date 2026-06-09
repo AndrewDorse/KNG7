@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import threading
 import time
 from typing import Any
+
+import requests
 
 try:
     import websocket
@@ -32,6 +35,7 @@ class BinancePriceFeed:
         *,
         url: str = DEFAULT_WS_URL,
         history_seconds: float = 30.0,
+        request_timeout_seconds: float = 10.0,
     ) -> None:
         if websocket is None:
             raise RuntimeError(
@@ -41,6 +45,7 @@ class BinancePriceFeed:
         self._symbols = tuple(sorted({str(s).upper() for s in symbols}))
         self._url = url
         self._history_seconds = max(15.0, float(history_seconds))
+        self._request_timeout_seconds = request_timeout_seconds
         self._lock = threading.Lock()
         self._prices: dict[str, deque[tuple[float, float]]] = {
             symbol: deque() for symbol in self._symbols
@@ -48,6 +53,9 @@ class BinancePriceFeed:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._ws_app: Any = None
+        self._window_opens: dict[tuple[str, int], float] = {}
+        self._open_attempts: dict[tuple[str, int], float] = {}
+        self._session = requests.Session()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -116,6 +124,87 @@ class BinancePriceFeed:
         if latest <= 0:
             return None
         return (max(selected) - min(selected)) / latest * 10_000.0
+
+    def prepare_window(self, start_ts: int) -> None:
+        """Fetch each pair's exact Binance one-minute candle open."""
+        now = time.monotonic()
+        missing: list[str] = []
+        with self._lock:
+            for symbol in self._symbols:
+                key = (symbol, start_ts)
+                if key in self._window_opens:
+                    continue
+                if now - self._open_attempts.get(key, 0.0) < 5.0:
+                    continue
+                self._open_attempts[key] = now
+                missing.append(symbol)
+        if not missing:
+            return
+        with ThreadPoolExecutor(max_workers=len(missing)) as executor:
+            futures = {
+                executor.submit(self._fetch_window_open, symbol, start_ts): symbol
+                for symbol in missing
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    opening = future.result()
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Binance open fetch failed symbol=%s start=%s: %s",
+                        symbol,
+                        start_ts,
+                        exc,
+                    )
+                    continue
+                if opening is not None and opening > 0:
+                    with self._lock:
+                        self._window_opens[(symbol, start_ts)] = opening
+        with self._lock:
+            cutoff = start_ts - 3600
+            self._window_opens = {
+                key: value
+                for key, value in self._window_opens.items()
+                if key[1] >= cutoff
+            }
+
+    def window_moves_bps(
+        self,
+        start_ts: int,
+        *,
+        max_age_seconds: float,
+    ) -> tuple[dict[str, float] | None, str]:
+        now = time.time()
+        moves: dict[str, float] = {}
+        with self._lock:
+            for symbol in self._symbols:
+                opening = self._window_opens.get((symbol, start_ts))
+                points = self._prices.get(symbol)
+                if opening is None:
+                    return None, f"{symbol}_open_unavailable"
+                if not points:
+                    return None, f"{symbol}_price_unavailable"
+                observed_at, price = points[-1]
+                if now - observed_at > max_age_seconds:
+                    return None, f"{symbol}_price_stale"
+                moves[symbol] = (price / opening - 1.0) * 10_000.0
+        return moves, "ok"
+
+    def _fetch_window_open(self, symbol: str, start_ts: int) -> float | None:
+        response = self._session.get(
+            "https://api.binance.com/api/v3/klines",
+            params={
+                "symbol": f"{symbol}USDT",
+                "interval": "1m",
+                "startTime": start_ts * 1000,
+                "endTime": (start_ts + 60) * 1000,
+                "limit": 1,
+            },
+            timeout=self._request_timeout_seconds,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        return float(rows[0][1]) if rows else None
 
     def _on_message(self, _ws: Any, message: str) -> None:
         try:

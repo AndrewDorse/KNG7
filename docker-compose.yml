@@ -1,4 +1,4 @@
-# KNG7: BTC + ETH + SOL + XRP late_high_5m GTC limits. Copy .env.example -> .env
+# KNG7: five-pair synchronized late_high_5m. Copy .env.example -> .env
 services:
   bot:
     build: .

@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-ARG KNG7_IMAGE_TAG=2026-06-07-four-asset-momentum
+ARG KNG7_IMAGE_TAG=2026-06-09-five-pair-alignment
 LABEL org.opencontainers.image.title="KNG7 late_high_5m" \
-      org.opencontainers.image.description="Docker: BTC, ETH, SOL and XRP 5m momentum-guarded 99c GTC limit buys" \
+      org.opencontainers.image.description="BTC ETH SOL XRP BNB synchronized Binance alignment 99c GTC limits" \
       org.opencontainers.image.version="${KNG7_IMAGE_TAG}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -363,15 +363,20 @@ class BotConfig:
     limit_pair_cleanup_poll_sec: float = 1.0
     limit_pair_cleanup_sell_max_rounds: int = 8
     # late_high_5m - late-window dominant-leg 99c GTC limit buy.
-    late_high_entry_lo_sec: int = 288
-    late_high_entry_hi_sec: int = 298
+    late_high_entry_lo_sec: int = 280
+    late_high_entry_hi_sec: int = 282
     late_high_fallback_sec: int = 295
-    late_high_min_leg_px: float = 0.97
+    late_high_min_leg_px: float = 0.98
     late_high_limit_px: float = 0.99
     late_high_min_shares: float = 5.0
     late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "BNB")
-    late_high_balance_fraction: float = 0.15
-    late_high_strict_balance_fraction: bool = True
+    late_high_balance_fraction: float = 0.11
+    late_high_strict_balance_fraction: bool = False
+    late_high_btc_bps: float = 8.0
+    late_high_eth_bps: float = 8.0
+    late_high_sol_bps: float = 8.0
+    late_high_xrp_bps: float = 10.0
+    late_high_bnb_bps: float = 10.0
     late_high_binance_ws_enabled: bool = True
     late_high_binance_ws_url: str = "wss://stream.binance.com:9443/stream"
     late_high_adverse_lookback_seconds: float = 10.0
@@ -821,10 +826,10 @@ class BotConfig:
             limit_pair_cleanup_sell_max_rounds=max(
                 1, _env_int("BOT_LIMIT_PAIR_CLEANUP_SELL_MAX_ROUNDS", 8)
             ),
-            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 288)),
-            late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 298)),
+            late_high_entry_lo_sec=max(0, _env_int("BOT_LATE_HIGH_ENTRY_LO_SEC", 280)),
+            late_high_entry_hi_sec=min(299, _env_int("BOT_LATE_HIGH_ENTRY_HI_SEC", 282)),
             late_high_fallback_sec=max(0, _env_int("BOT_LATE_HIGH_FALLBACK_SEC", 295)),
-            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.97))),
+            late_high_min_leg_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_MIN_LEG_PX", 0.98))),
             late_high_limit_px=max(0.01, min(0.99, _env_float("BOT_LATE_HIGH_LIMIT_PX", 0.99))),
             late_high_min_shares=max(0.0001, _env_float("BOT_LATE_HIGH_MIN_SHARES", 5.0)),
             late_high_symbols=_parse_symbol_list(
@@ -832,11 +837,16 @@ class BotConfig:
                 default=("BTC", "ETH", "SOL", "XRP", "BNB"),
             ),
             late_high_balance_fraction=max(
-                0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.15))
+                0.01, min(1.0, _env_float("BOT_LATE_HIGH_BALANCE_FRACTION", 0.11))
             ),
             late_high_strict_balance_fraction=_env_bool(
-                "BOT_LATE_HIGH_STRICT_BALANCE_FRACTION", True
+                "BOT_LATE_HIGH_STRICT_BALANCE_FRACTION", False
             ),
+            late_high_btc_bps=max(0.0, _env_float("BOT_LATE_HIGH_BTC_BPS", 8.0)),
+            late_high_eth_bps=max(0.0, _env_float("BOT_LATE_HIGH_ETH_BPS", 8.0)),
+            late_high_sol_bps=max(0.0, _env_float("BOT_LATE_HIGH_SOL_BPS", 8.0)),
+            late_high_xrp_bps=max(0.0, _env_float("BOT_LATE_HIGH_XRP_BPS", 10.0)),
+            late_high_bnb_bps=max(0.0, _env_float("BOT_LATE_HIGH_BNB_BPS", 10.0)),
             late_high_binance_ws_enabled=_env_bool("BOT_LATE_HIGH_BINANCE_WS_ENABLED", True),
             late_high_binance_ws_url=(
                 os.getenv(
@@ -946,6 +956,10 @@ class BotConfig:
                         f"{name} must be between 0.01 and 0.99 (got {px})."
                     )
         if cfg.strategy_mode == "late_high_5m":
+            if cfg.late_high_symbols != ("BTC", "ETH", "SOL", "XRP", "BNB"):
+                raise BotConfigError(
+                    "This KNG7 build requires BOT_LATE_HIGH_SYMBOLS=BTC,ETH,SOL,XRP,BNB"
+                )
             if cfg.late_high_entry_lo_sec > cfg.late_high_entry_hi_sec:
                 raise BotConfigError("BOT_LATE_HIGH_ENTRY_LO_SEC must be <= BOT_LATE_HIGH_ENTRY_HI_SEC")
             if cfg.late_high_fallback_sec < cfg.late_high_entry_lo_sec:

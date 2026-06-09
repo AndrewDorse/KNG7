@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-asset 5m late-price 99c GTC limit-buy engine."""
+"""Five-pair synchronized Binance alignment 99c GTC limit-buy engine."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 import time
 from pathlib import Path
 
+from binance_ws import BinancePriceFeed
 from config import ActiveContract, BotConfig, LOGGER
 from market_locator import GammaMarketLocator
 from trader import PolymarketTrader
@@ -58,6 +59,7 @@ class LateHighEngine:
         config: BotConfig,
         locator: GammaMarketLocator,
         trader: PolymarketTrader,
+        binance_feed: BinancePriceFeed | None = None,
     ) -> None:
         self.config = config
         self.locator = locator
@@ -65,9 +67,18 @@ class LateHighEngine:
         self._state_path = _resolve_state_path(config.late_high_state_path)
         self._submitted_slugs: set[str] = set()
         self._pending_orders: dict[str, dict[str, object]] = {}
+        self._evaluated_window_starts: set[int] = set()
         self._last_idle_log_mono: dict[str, float] = {}
         self._cached_balance_usdc: float | None = None
         self._next_balance_refresh_mono = 0.0
+        self._last_gate_log_mono = 0.0
+        self._binance_feed = binance_feed or BinancePriceFeed(
+            config.late_high_symbols,
+            url=config.late_high_binance_ws_url,
+            history_seconds=30.0,
+            request_timeout_seconds=config.request_timeout_seconds,
+        )
+        self._binance_feed.start()
         self._load_state()
 
     def _load_state(self) -> None:
@@ -80,6 +91,9 @@ class LateHighEngine:
             return
         if isinstance(raw, dict):
             self._submitted_slugs = {str(s) for s in raw.get("submitted_slugs", [])}
+            self._evaluated_window_starts = {
+                int(value) for value in raw.get("evaluated_window_starts", [])
+            }
             pending = raw.get("pending_orders") or {}
             if isinstance(pending, dict):
                 self._pending_orders = {
@@ -98,9 +112,13 @@ class LateHighEngine:
             for slug, value in self._pending_orders.items()
             if (_slug_start_ts(slug) or 0) >= cutoff
         }
+        self._evaluated_window_starts = {
+            start_ts for start_ts in self._evaluated_window_starts if start_ts >= cutoff
+        }
         payload = {
             "submitted_slugs": sorted(self._submitted_slugs),
             "pending_orders": self._pending_orders,
+            "evaluated_window_starts": sorted(self._evaluated_window_starts),
             "updated_at": int(time.time()),
         }
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,35 +140,22 @@ class LateHighEngine:
         self.trader.sync_ws_subscriptions([contract for _, contract in contracts])
         return contracts
 
-    def _midpoint(self, token_id: str) -> float | None:
-        if self.trader.ws_quotes_active:
-            return self.trader.get_ws_midpoint(token_id)
-        return self.trader.get_midpoint(token_id)
+    def _thresholds(self) -> dict[str, float]:
+        return {
+            "BTC": self.config.late_high_btc_bps,
+            "ETH": self.config.late_high_eth_bps,
+            "SOL": self.config.late_high_sol_bps,
+            "XRP": self.config.late_high_xrp_bps,
+            "BNB": self.config.late_high_bnb_bps,
+        }
 
-    def _pick_signal(
-        self,
-        contract: ActiveContract,
-        elapsed: int,
-    ) -> tuple[str, float] | None:
-        if (
-            elapsed < self.config.late_high_entry_lo_sec
-            or elapsed > self.config.late_high_entry_hi_sec
-            or elapsed >= self.config.late_high_cancel_unfilled_at_sec
-        ):
-            return None
-        up_mid = self._midpoint(contract.up.token_id)
-        down_mid = self._midpoint(contract.down.token_id)
-        if up_mid is None or down_mid is None:
-            return None
-        candidates: list[tuple[str, float]] = []
-        if up_mid > self.config.late_high_min_leg_px:
-            candidates.append(("UP", up_mid))
-        if down_mid > self.config.late_high_min_leg_px:
-            candidates.append(("DOWN", down_mid))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: item[1], reverse=True)
-        return candidates[0]
+    def _alignment_side(self, moves: dict[str, float]) -> str | None:
+        thresholds = self._thresholds()
+        if all(moves.get(symbol, float("-inf")) >= threshold for symbol, threshold in thresholds.items()):
+            return "UP"
+        if all(moves.get(symbol, float("inf")) <= -threshold for symbol, threshold in thresholds.items()):
+            return "DOWN"
+        return None
 
     def _shares_for_balance(self, balance: float) -> tuple[float, float] | None:
         px = self.config.late_high_limit_px
@@ -173,10 +178,7 @@ class LateHighEngine:
 
     def _balance_usdc(self) -> float:
         if self.config.dry_run:
-            return max(
-                self.config.late_high_limit_px * self.config.late_high_min_shares,
-                10.0,
-            )
+            return 100.0
         mono = time.monotonic()
         if self._cached_balance_usdc is None or mono >= self._next_balance_refresh_mono:
             self._cached_balance_usdc = self.trader.wallet_balance_usdc()
@@ -221,41 +223,30 @@ class LateHighEngine:
         contract: ActiveContract,
         elapsed: int,
         side: str,
-        signal_px: float,
-    ) -> None:
-        balance = self._balance_usdc()
-        if not self.config.dry_run and balance <= 0:
-            _out(f"SKIP symbol={symbol} slug={contract.slug} reason=no_usdc_balance")
-            return
-        sized = self._shares_for_balance(balance)
-        if sized is None:
-            need = self.config.late_high_limit_px * self.config.late_high_min_shares
-            risk_budget = balance * self.config.late_high_balance_fraction
-            reason = (
-                "risk_budget_below_min"
-                if self.config.late_high_strict_balance_fraction
-                and risk_budget + 1e-9 < need
-                else "insufficient_for_min_shares"
-            )
-            _out(
-                f"SKIP symbol={symbol} slug={contract.slug} reason={reason} "
-                f"balance={balance:.4f} risk_budget={risk_budget:.4f} need={need:.4f}"
-            )
-            return
+        signal_bps: float,
+        sized: tuple[float, float],
+    ) -> bool:
         shares, cost = sized
         token = contract.up if side == "UP" else contract.down
         limit_px = self.config.late_high_limit_px
         if self.config.dry_run:
             _out(
                 f"ORDER dry_run symbol={symbol} slug={contract.slug} side={side} "
-                f"signal={signal_px:.3f} limit={limit_px:.2f} shares={shares:.4f} "
+                f"move={signal_bps:.2f}bps limit={limit_px:.2f} shares={shares:.4f} "
                 f"cost={cost:.4f} elapsed={elapsed}s"
             )
         else:
-            self.trader.place_limit_buy(token, limit_px, shares)
+            try:
+                self.trader.place_limit_buy(token, limit_px, shares)
+            except Exception as exc:  # noqa: BLE001
+                _out(
+                    f"ORDER_FAIL symbol={symbol} slug={contract.slug} side={side} "
+                    f"reason={type(exc).__name__}:{exc}"
+                )
+                return False
             _out(
                 f"ORDER symbol={symbol} slug={contract.slug} side={side} "
-                f"signal={signal_px:.3f} limit={limit_px:.2f} shares={shares:.4f} "
+                f"move={signal_bps:.2f}bps limit={limit_px:.2f} shares={shares:.4f} "
                 f"cost={cost:.4f} elapsed={elapsed}s"
             )
         self._submitted_slugs.add(contract.slug)
@@ -268,31 +259,66 @@ class LateHighEngine:
             + self.config.late_high_cancel_unfilled_at_sec,
         }
         self._save_state()
+        return True
 
     def _tick(self) -> None:
         now_ts = int(time.time())
         self._manage_pending_orders(now_ts)
-        for symbol, contract in self._active_contracts(now_ts):
+        start_ts = (now_ts // _WINDOW_SEC) * _WINDOW_SEC
+        elapsed = now_ts - start_ts
+        if start_ts in self._evaluated_window_starts:
+            return
+        self._binance_feed.prepare_window(start_ts)
+        contracts = dict(self._active_contracts(now_ts))
+        if elapsed < self.config.late_high_entry_lo_sec:
+            return
+        if elapsed > self.config.late_high_entry_hi_sec:
+            self._evaluated_window_starts.add(start_ts)
+            self._save_state()
+            _out(f"SKIP window={start_ts} reason=signal_deadline_missed elapsed={elapsed}s")
+            return
+        if set(contracts) != set(self.config.late_high_symbols):
+            return
+        moves, reason = self._binance_feed.window_moves_bps(
+            start_ts,
+            max_age_seconds=self.config.late_high_binance_max_age_seconds,
+        )
+        if moves is None:
+            mono = time.monotonic()
+            if mono - self._last_gate_log_mono >= 1.0:
+                _out(f"WAIT window={start_ts} reason={reason} elapsed={elapsed}s")
+                self._last_gate_log_mono = mono
+            return
+        side = self._alignment_side(moves)
+        self._evaluated_window_starts.add(start_ts)
+        self._save_state()
+        detail = ",".join(f"{symbol}={moves[symbol]:.2f}" for symbol in self.config.late_high_symbols)
+        if side is None:
+            _out(f"BLOCK window={start_ts} reason=five_pair_not_aligned moves={detail}")
+            return
+        balance_snapshot = self._balance_usdc()
+        sized = self._shares_for_balance(balance_snapshot)
+        if sized is None:
+            _out(
+                f"SKIP window={start_ts} reason=insufficient_for_min_shares "
+                f"balance={balance_snapshot:.4f}"
+            )
+            return
+        _out(
+            f"SIGNAL window={start_ts} side={side} elapsed={elapsed}s moves={detail} "
+            f"balance={balance_snapshot:.4f}"
+        )
+        for symbol in self.config.late_high_symbols:
+            contract = contracts[symbol]
             if contract.slug in self._submitted_slugs:
                 continue
-            start_ts = _slug_start_ts(contract.slug)
-            if start_ts is None:
-                continue
-            elapsed = now_ts - start_ts
-            signal = self._pick_signal(contract, elapsed)
-            if signal is None:
-                mono = time.monotonic()
-                if mono - self._last_idle_log_mono.get(symbol, 0.0) >= 30:
-                    _out(f"IDLE symbol={symbol} slug={contract.slug} elapsed={elapsed}s")
-                    self._last_idle_log_mono[symbol] = mono
-                continue
-            side, signal_px = signal
             self._submit(
                 symbol=symbol,
                 contract=contract,
                 elapsed=elapsed,
                 side=side,
-                signal_px=signal_px,
+                signal_bps=moves[symbol] if side == "UP" else -moves[symbol],
+                sized=sized,
             )
 
     def run(self) -> None:
@@ -300,7 +326,10 @@ class LateHighEngine:
             "INIT "
             f"strategy=late_high_5m symbols={','.join(self.config.late_high_symbols)} "
             f"entry={self.config.late_high_entry_lo_sec}-{self.config.late_high_entry_hi_sec}s "
-            f"signal_gt={self.config.late_high_min_leg_px:.2f} "
+            "alignment=all5 "
+            f"thresholds=BTC:{self.config.late_high_btc_bps:g},"
+            f"ETH:{self.config.late_high_eth_bps:g},SOL:{self.config.late_high_sol_bps:g},"
+            f"XRP:{self.config.late_high_xrp_bps:g},BNB:{self.config.late_high_bnb_bps:g}bps "
             f"limit={self.config.late_high_limit_px:.2f} "
             f"balance_fraction={self.config.late_high_balance_fraction:.2f} "
             f"strict_fraction={self.config.late_high_strict_balance_fraction} "

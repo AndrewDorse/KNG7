@@ -168,7 +168,6 @@ class LateHighEngine:
             "XRP": self.config.late_high_xrp_bps,
             "BNB": self.config.late_high_bnb_bps,
             "DOGE": self.config.late_high_doge_bps,
-            "HYPE": self.config.late_high_hype_bps,
         }
 
     def _active_combinations(self) -> tuple[tuple[str, ...], ...]:

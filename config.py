@@ -393,8 +393,12 @@ class BotConfig:
     late_high_symbols: tuple[str, ...] = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
     late_high_combinations: tuple[tuple[str, ...], ...] = (
         ("BTC", "ETH", "DOGE"),
-        ("BTC", "ETH", "SOL", "XRP", "DOGE"),
-        ("ETH", "SOL", "XRP", "DOGE", "HYPE"),
+        ("BTC", "ETH", "SOL", "XRP"),
+        ("BTC", "SOL", "XRP", "DOGE"),
+        ("BTC", "ETH", "BNB", "DOGE"),
+        ("BTC", "SOL", "DOGE"),
+        ("SOL", "XRP", "BNB"),
+        ("ETH", "SOL", "XRP", "DOGE"),
     )
     late_high_balance_fraction: float = 0.11
     late_high_strict_balance_fraction: bool = False
@@ -404,7 +408,6 @@ class BotConfig:
     late_high_xrp_bps: float = 10.0
     late_high_bnb_bps: float = 10.0
     late_high_doge_bps: float = 10.0
-    late_high_hype_bps: float = 10.0
     late_high_binance_ws_enabled: bool = True
     late_high_binance_ws_url: str = "wss://stream.binance.com:9443/stream"
     late_high_adverse_lookback_seconds: float = 10.0
@@ -866,8 +869,12 @@ class BotConfig:
                 os.getenv("BOT_LATE_HIGH_COMBINATIONS"),
                 default=(
                     ("BTC", "ETH", "DOGE"),
-                    ("BTC", "ETH", "SOL", "XRP", "DOGE"),
-                    ("ETH", "SOL", "XRP", "DOGE", "HYPE"),
+                    ("BTC", "ETH", "SOL", "XRP"),
+                    ("BTC", "SOL", "XRP", "DOGE"),
+                    ("BTC", "ETH", "BNB", "DOGE"),
+                    ("BTC", "SOL", "DOGE"),
+                    ("SOL", "XRP", "BNB"),
+                    ("ETH", "SOL", "XRP", "DOGE"),
                 ),
             ),
             late_high_balance_fraction=max(
@@ -882,7 +889,6 @@ class BotConfig:
             late_high_xrp_bps=max(0.0, _env_float("BOT_LATE_HIGH_XRP_BPS", 10.0)),
             late_high_bnb_bps=max(0.0, _env_float("BOT_LATE_HIGH_BNB_BPS", 10.0)),
             late_high_doge_bps=max(0.0, _env_float("BOT_LATE_HIGH_DOGE_BPS", 10.0)),
-            late_high_hype_bps=max(0.0, _env_float("BOT_LATE_HIGH_HYPE_BPS", 10.0)),
             late_high_binance_ws_enabled=_env_bool("BOT_LATE_HIGH_BINANCE_WS_ENABLED", True),
             late_high_binance_ws_url=(
                 os.getenv(
@@ -990,7 +996,7 @@ class BotConfig:
                     "This KNG7 build requires "
                     "BOT_LATE_HIGH_SYMBOLS=BTC,ETH,SOL,XRP,BNB,DOGE"
                 )
-            supported = set(cfg.late_high_symbols) | {"HYPE"}
+            supported = set(cfg.late_high_symbols)
             unknown = sorted(
                 {
                     symbol

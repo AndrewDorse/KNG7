@@ -268,8 +268,9 @@ class LateHighEngine:
         elapsed: int,
         moves: dict[str, float],
         contracts: dict[str, ActiveContract],
+        combinations: tuple[tuple[str, ...], ...] | None = None,
     ) -> None:
-        for combination in self._active_combinations():
+        for combination in combinations or self._active_combinations():
             key = _combination_key(combination)
             if key in self._fired_combinations:
                 continue
@@ -346,30 +347,35 @@ class LateHighEngine:
                 self._deadline_logged = True
             return
 
-        moves, reason = self._binance_feed.window_moves_bps(
-            start_ts,
-            max_age_seconds=self.config.late_high_binance_max_age_seconds,
-            symbols=tuple(
-                dict.fromkeys(
-                    symbol
-                    for combination in self._active_combinations()
-                    for symbol in combination
-                )
-            ),
-        )
-        if moves is None:
+        blocked: list[str] = []
+        for combination in self._active_combinations():
+            key = _combination_key(combination)
+            if key in self._fired_combinations:
+                continue
+            moves, reason = self._binance_feed.window_moves_bps(
+                start_ts,
+                max_age_seconds=self.config.late_high_binance_max_age_seconds,
+                symbols=combination,
+            )
+            if moves is None:
+                blocked.append(f"{key}:{reason}")
+                continue
+            self._evaluate_combinations(
+                start_ts=start_ts,
+                elapsed=elapsed,
+                moves=moves,
+                contracts=contracts,
+                combinations=(combination,),
+            )
+
+        if blocked:
             mono = time.monotonic()
             if mono - self._last_gate_log_mono >= 1.0:
-                _out(f"WAIT window={start_ts} reason={reason} elapsed={elapsed}s")
+                _out(
+                    f"WAIT window={start_ts} blocked={','.join(blocked)} "
+                    f"elapsed={elapsed}s"
+                )
                 self._last_gate_log_mono = mono
-            return
-
-        self._evaluate_combinations(
-            start_ts=start_ts,
-            elapsed=elapsed,
-            moves=moves,
-            contracts=contracts,
-        )
 
     def run(self) -> None:
         active = ",".join(_combination_key(value) for value in self._active_combinations())

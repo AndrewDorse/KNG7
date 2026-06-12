@@ -214,14 +214,16 @@ class BinancePriceFeed:
             data = envelope.get("data", envelope)
             symbol = str(data.get("s") or "").upper()
             price = float(data.get("c"))
-            event_ms = float(data.get("E") or 0)
+            receipt_time = time.time()
         except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
             return
         if symbol.endswith("USDT"):
             symbol = symbol[:-4]
         if symbol not in self._prices or price <= 0:
             return
-        observed_at = event_ms / 1000.0 if event_ms > 0 else time.time()
+        # Freshness is a property of the local connection. Binance event time can
+        # lag or jump independently of when this process actually received data.
+        observed_at = receipt_time
         cutoff = observed_at - self._history_seconds
         with self._lock:
             points = self._prices[symbol]

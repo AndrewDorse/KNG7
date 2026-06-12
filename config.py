@@ -907,7 +907,7 @@ class BotConfig:
                 1.0, _env_float("BOT_LATE_HIGH_QUARANTINE_SECONDS", 20.0)
             ),
             late_high_binance_max_age_seconds=max(
-                0.25, _env_float("BOT_LATE_HIGH_BINANCE_MAX_AGE_SECONDS", 2.0)
+                0.25, _env_float("BOT_LATE_HIGH_BINANCE_MAX_AGE_SECONDS", 5.0)
             ),
             late_high_early_confirmation_seconds=max(
                 0.0, _env_float("BOT_LATE_HIGH_EARLY_CONFIRMATION_SECONDS", 15.0)

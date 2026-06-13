@@ -24,6 +24,7 @@ else:
 
 LOGGER = logging.getLogger("polymarket_btc_ladder")
 DEFAULT_WS_URL = "wss://stream.binance.com:9443/stream"
+STALE_RECONNECT_SECONDS = 10.0
 
 
 class BinancePriceFeed:
@@ -53,6 +54,7 @@ class BinancePriceFeed:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._ws_app: Any = None
+        self._last_message_mono = 0.0
         self._window_opens: dict[tuple[str, int], float] = {}
         self._open_attempts: dict[tuple[str, int], float] = {}
         self._session = requests.Session()
@@ -209,6 +211,8 @@ class BinancePriceFeed:
         return float(rows[0][1]) if rows else None
 
     def _on_message(self, _ws: Any, message: str) -> None:
+        with self._lock:
+            self._last_message_mono = time.monotonic()
         try:
             envelope = json.loads(message)
             data = envelope.get("data", envelope)
@@ -235,13 +239,49 @@ class BinancePriceFeed:
         streams = "/".join(f"{symbol.lower()}usdt@miniTicker" for symbol in self._symbols)
         url = f"{self._url}?streams={streams}"
         while not self._stop.is_set():
+            session_done = threading.Event()
             try:
-                app = websocket.WebSocketApp(url, on_message=self._on_message)
+                def on_open(_ws: Any) -> None:
+                    with self._lock:
+                        self._last_message_mono = time.monotonic()
+
+                app = websocket.WebSocketApp(
+                    url,
+                    on_open=on_open,
+                    on_message=self._on_message,
+                )
                 self._ws_app = app
+                with self._lock:
+                    self._last_message_mono = time.monotonic()
+                watchdog = threading.Thread(
+                    target=self._watch_connection,
+                    args=(app, session_done),
+                    name="binance-ws-watchdog",
+                    daemon=True,
+                )
+                watchdog.start()
                 app.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
                 LOGGER.warning("Binance WS error: %s", exc)
             finally:
+                session_done.set()
                 self._ws_app = None
             if not self._stop.is_set():
                 time.sleep(1.0)
+
+    def _watch_connection(self, app: Any, session_done: threading.Event) -> None:
+        while not self._stop.is_set() and not session_done.wait(0.5):
+            with self._lock:
+                last_message_mono = self._last_message_mono
+            age = time.monotonic() - last_message_mono
+            if last_message_mono > 0 and age >= STALE_RECONNECT_SECONDS:
+                print(
+                    "BINANCE_WS_RECONNECT "
+                    f"reason=no_messages age={age:.1f}s",
+                    flush=True,
+                )
+                try:
+                    app.close()
+                except Exception as exc:
+                    LOGGER.warning("Binance WS watchdog close failed: %s", exc)
+                return
